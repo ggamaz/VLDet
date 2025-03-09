@@ -3854,3 +3854,52 @@ class CachedMixUp(BaseTransform):
         repr_str += f'random_pop={self.random_pop}, '
         repr_str += f'prob={self.prob})'
         return repr_str
+
+from typing import Callable
+@TRANSFORMS.register_module()
+class SpiltMultiChannel(BaseTransform):
+    
+    def __init__(self,
+                 channels: Union[List[int], Tuple[int, ...]],
+                 transforms: Optional[Sequence[Union[dict, Callable]]] = None
+                ) -> None:
+        super().__init__()
+        
+        self.each_channels = channels
+        self.transforms: List[Callable] = []
+
+        if transforms is None:
+            transforms = []
+
+        for transform in transforms:
+            # `Compose` can be built with config dict with type and
+            # corresponding arguments.
+            if isinstance(transform, dict):
+                transform = TRANSFORMS.build(transform)
+                if not callable(transform):
+                    raise TypeError(f'transform should be a callable object, '
+                                    f'but got {type(transform)}')
+                self.transforms.append(transform)
+            elif callable(transform):
+                self.transforms.append(transform)
+            else:
+                raise TypeError(
+                    f'transform must be a callable object or dict, '
+                    f'but got {type(transform)}')
+        
+    def transform(self, results:dict) -> dict:
+        img: np.array = results.pop('img')
+        start = 0
+        for channel in self.each_channels:
+            _results = copy.deepcopy(results)
+            _results['img'] = img[:, :, start:start+channel]
+            for t in self.transforms:
+                _results = t(_results)
+            img[:, :, start:start+channel] = _results['img']
+            start += channel
+        _results['img'] = img
+        return _results
+    
+    def __repr__(self):
+        repr_str = self.__class__.__name__    
+        return repr_str

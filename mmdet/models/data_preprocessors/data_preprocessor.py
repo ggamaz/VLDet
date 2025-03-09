@@ -791,3 +791,93 @@ class BoxInstDataPreprocessor(DetDataPreprocessor):
                     per_im_masks.cpu().numpy(), b_img_h, b_img_w)
                 data_sample.gt_instances.pairwise_masks = pairwise_masks
         return {'inputs': inputs, 'data_samples': data_samples}
+
+import math
+from mmengine.model.utils import stack_batch
+from mmengine.model.base_model.data_preprocessor import BaseDataPreprocessor
+@MODELS.register_module()
+class DetMultiChannelDataPreprocessor(DetDataPreprocessor):
+    
+    def __init__(self,
+                 mean: Sequence[Number] = None,
+                 std: Sequence[Number] = None,
+                 pad_size_divisor: int = 1,
+                 pad_value: Union[float, int] = 0,
+                 pad_mask: bool = False,
+                 mask_pad_value: int = 0,
+                 pad_seg: bool = False,
+                 seg_pad_value: int = 255,
+                 bgr_to_rgb: bool = False,
+                 rgb_to_bgr: bool = False,
+                 boxtype2tensor: bool = True,
+                 non_blocking: Optional[bool] = False,
+                 batch_augments: Optional[List[dict]] = None):
+        BaseDataPreprocessor.__init__(self, non_blocking)
+        assert not (bgr_to_rgb and rgb_to_bgr), (
+            '`bgr2rgb` and `rgb2bgr` cannot be set to True at the same time')
+        assert (mean is None) == (std is None), (
+            'mean and std should be both None or tuple')
+        if mean is not None:
+            self._enable_normalize = True
+            self.register_buffer('mean',
+                                 torch.tensor(mean).view(-1, 1, 1), False)
+            self.register_buffer('std',
+                                 torch.tensor(std).view(-1, 1, 1), False)
+        else:
+            self._enable_normalize = False
+        self._channel_conversion = rgb_to_bgr or bgr_to_rgb
+        self.pad_size_divisor = pad_size_divisor
+        self.pad_value = pad_value
+        
+        if batch_augments is not None:
+            self.batch_augments = nn.ModuleList(
+                [MODELS.build(aug) for aug in batch_augments])
+        else:
+            self.batch_augments = None
+        self.pad_mask = pad_mask
+        self.mask_pad_value = mask_pad_value
+        self.pad_seg = pad_seg
+        self.seg_pad_value = seg_pad_value
+        self.boxtype2tensor = boxtype2tensor
+        
+    def channel_conversion(self, inputs):
+        if self._channel_conversion:
+            self._channel_conversion = False
+            
+            if is_seq_of(inputs, torch.Tensor):
+                res = []
+                for input_data in inputs:
+                    N = input_data.shape[0]//3
+                    reshaped_data = input_data.view(N, 3, *input_data.shape[1:])
+                    swaped_data = reshaped_data[:, [2, 1, 0], ...]
+                    res.append(swaped_data.view(input_data.shape[:]))
+                return res
+            
+            elif isinstance(inputs, torch.Tensor):
+                if inputs.shape == 3 and inputs.shape[0] == 3:
+                    return inputs[[2, 1, 0], ...]
+                elif inputs.shape == 4 and inputs.shape[1] == 3:
+                    return inputs[:, [2, 1, 0], ...]
+                else:
+                    raise ValueError('The shape of input should be (3, H, W) '
+                                     'or (N, 3, H, W), but got {}'.format(
+                                         inputs.shape))
+            else:
+                raise TypeError('inputs should be a tensor or a list of tensor, '
+                                f'but got {type(inputs)}')
+        else:
+            return inputs
+    
+    def forward(self, data: dict, training: bool = False) -> dict:
+        """Perform normalization,padding and bgr2rgb conversion based on
+        ``BaseDataPreprocessor``.
+
+        Args:
+            data (dict): Data sampled from dataloader.
+            training (bool): Whether to enable training time augmentation.
+
+        Returns:
+            dict: Data in the same format as the model input.
+        """
+        data['inputs'] = self.channel_conversion(data['inputs'])
+        return super().forward(data, training)

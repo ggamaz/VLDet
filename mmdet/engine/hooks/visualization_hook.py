@@ -358,7 +358,6 @@ class GroundingVisualizationHook(DetVisualizationHook):
         """
         if self.draw is False:
             return
-
         if self.test_out_dir is not None:
             self.test_out_dir = osp.join(runner.work_dir, runner.timestamp,
                                          self.test_out_dir)
@@ -369,7 +368,10 @@ class GroundingVisualizationHook(DetVisualizationHook):
 
             self._test_index += 1
 
+            # import ipdb; ipdb.set_trace()
             img_path = data_sample.img_path
+            if isinstance(img_path, list):
+                img_path = img_path[0]
             img_bytes = get(img_path, backend_args=self.backend_args)
             img = mmcv.imfrombytes(img_bytes, channel_order='rgb')
 

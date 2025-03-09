@@ -67,15 +67,16 @@ from mmdet.evaluation import get_classes
 def parse_args():
     parser = ArgumentParser()
     parser.add_argument(
-        'inputs', type=str, help='Input image file or folder path.')
+        '--inputs', type=str, default='demo/animals.png', help='Input image file or folder path.')
     parser.add_argument(
-        'model',
+        '--model',
         type=str,
+        default='configs/mm_grounding_dino/grounding_dino_swin-t_pretrain_obj365.py',
         help='Config or checkpoint .pth file or the model name '
         'and alias defined in metafile. The model configuration '
         'file will try to read from .pth if the parameter is '
         'a .pth weights file.')
-    parser.add_argument('--weights', default=None, help='Checkpoint file')
+    parser.add_argument('--weights', default='weights/grounding_dino_swin-t_pretrain_obj365_goldg_grit9m_v3det_20231204_095047-b448804b.pth', help='Checkpoint file')
     parser.add_argument(
         '--out-dir',
         type=str,
@@ -86,7 +87,7 @@ def parse_args():
     # support $: coco, $: voc, $: cityscapes, $: lvis, $: imagenet_det.
     # detail to `mmdet/evaluation/functional/class_names.py`
     parser.add_argument(
-        '--texts', help='text prompt, such as "bench . car .", "$: coco"')
+        '--texts', default='zebra . graffi',help='text prompt, such as "bench . car .", "$: coco"')
     parser.add_argument(
         '--device', default='cuda:0', help='Device used for inference')
     parser.add_argument(

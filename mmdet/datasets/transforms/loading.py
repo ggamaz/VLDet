@@ -133,7 +133,8 @@ class LoadMultiChannelImageFromFiles(BaseTransform):
                     img_bytes,
                     flag=self.color_type,
                     backend=self.imdecode_backend))
-        img = np.stack(img, axis=-1)
+        img = np.concatenate(img, axis=-1) # H, W, concatC
+        # img = np.stack(img, axis=-1) # H, W, C, stack
         if self.to_float32:
             img = img.astype(np.float32)
 

@@ -1,6 +1,6 @@
 # dataset settings
 dataset_type = 'CocoDataset'
-data_root = '/home/legion/Pictures/Datasets/COCO/'
+data_root = 'data/coco/'
 
 # Example to use different file client
 # Method 1: simply set the data root and let the file I/O module
@@ -58,7 +58,7 @@ val_dataloader = dict(
         type=dataset_type,
         data_root=data_root,
         ann_file='annotations/instances_val2017.json',
-        data_prefix=dict(img='images/val2017/'),
+        data_prefix=dict(img='val2017/'),
         test_mode=True,
         pipeline=test_pipeline,
         backend_args=backend_args))
@@ -68,6 +68,7 @@ val_evaluator = dict(
     type='CocoMetric',
     ann_file=data_root + 'annotations/instances_val2017.json',
     metric='bbox',
+    classwise=True,
     format_only=False,
     backend_args=backend_args)
 test_evaluator = val_evaluator

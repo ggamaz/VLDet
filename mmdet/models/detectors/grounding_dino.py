@@ -619,3 +619,24 @@ class GroundingDINO(DINO):
                 pred_instances.label_names = label_names
             data_sample.pred_instances = pred_instances
         return batch_data_samples
+
+    def extract_feat(self, batch_inputs: Tensor) -> Tuple[Tensor]:
+        #multi-channel image feature extraction pre-processing
+        res = []
+        for _batch_input in batch_inputs:
+            N = _batch_input.shape[0] // 2
+            res.append(_batch_input[:N, ...])
+            res.append(_batch_input[N:, ...])
+        batch_inputs = torch.stack(res, dim=0)
+
+        # image feature extraction
+        visual_feats = super().extract_feat(batch_inputs)
+
+        #multi-channel image feature extraction post-processing
+        N = visual_feats[0].shape[0] // 2
+        _visual_feats = []
+        for i in range(len(visual_feats)):
+            _visual_feats.append(visual_feats[i].reshape(N, 2, *visual_feats[i].shape[1:]).sum(dim=1, keepdim=False)/2)
+        visual_feats = tuple(_visual_feats)
+        
+        return visual_feats
