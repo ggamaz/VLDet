@@ -19,9 +19,9 @@ from mmdet.utils import setup_cache_size_limit_of_dynamo
 def parse_args():
     parser = argparse.ArgumentParser(
         description='MMDet test (and eval) a model')
-    parser.add_argument('--config', default='local_configs/grounding_dino_swin-t_finetune_8xb4_20e_cat.py', help='test config file path')
-    # parser.add_argument('--config', default='configs/mm_grounding_dino/grounding_dino_swin-t_pretrain_obj365.py', help='test config file path')
-    parser.add_argument('--checkpoint',default='weights/grounding_dino_swin-t_pretrain_obj365_goldg_grit9m_v3det_20231204_095047-b448804b.pth', help='checkpoint file')
+    # parser.add_argument('--config', default='local_configs/grounding_dino_swin-t_finetune_8xb4_20e_cat.py', help='test config file path')
+    parser.add_argument('--config', default='configs/mm_grounding_dino/grounding_dino_swin-t_finetune_8xb4_20e_cat.py', help='test config file path')
+    parser.add_argument('--checkpoint', default='weights/grounding_dino_swin-t_pretrain_obj365_goldg_grit9m_v3det_20231204_095047-b448804b.pth', help='checkpoint file')
     parser.add_argument(
         '--work-dir',
         help='the directory to save the file containing evaluation metrics')

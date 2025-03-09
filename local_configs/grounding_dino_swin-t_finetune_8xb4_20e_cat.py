@@ -7,14 +7,14 @@ dataset_type = 'PairedCocoDataset'
 
 class_name = ('car', 'bus', 'freight_car', 'truck', 'van')
 num_classes = len(class_name)
-metainfo = dict(
-    classes=class_name, 
-    palette=[(220, 20, 60), (119, 11, 32), (0, 0, 142), (0, 0, 230), (106, 0, 228),]
-)
 model = dict(bbox_head=dict(num_classes=num_classes))
 
 train_pipeline = [
-    dict(type='LoadMultiChannelImageFromFiles'),
+    dict(
+        type='LoadMultiChannelImageFromFiles',
+        color_type='color',
+        backend_args=None,
+        imdecode_backend='pillow'),
     dict(type='LoadAnnotations', with_bbox=True),
     dict(type='RandomFlip', prob=0.5),
     dict(
@@ -58,50 +58,15 @@ train_pipeline = [
 train_dataloader = dict(
     dataset=dict(
         _delete_=True,
-        type='CocoDataset',
+        type=dataset_type,
         data_root=data_root,
-        metainfo=metainfo,
         return_classes=True,
         pipeline=train_pipeline,
         filter_cfg=dict(filter_empty_gt=False, min_size=32),
-        ann_file='annotations/trainval.json',
-        data_prefix=dict(img='images/')))
+        ann_file='coco_annotations/DV_train_ir.json',
+        data_prefix=dict(imga='train/rgb/images/',
+                         imgb='train/ir/images/')))
 
-
-train_dataloader = dict(
-    batch_size=2,
-    num_workers=2,
-    persistent_workers=True,
-    sampler=dict(type='MultiSourceSampler', batch_size=5, source_ratio=[1, 1],shuffle=True),
-    batch_sampler=None,
-    dataset=dict(
-        type='ConcatDataset',
-        datasets=[
-            dict(
-                _delete_=True,
-                type=dataset_type,
-                data_root=data_root,
-                metainfo=metainfo,
-                return_classes=True,
-                pipeline=train_pipeline,
-                filter_cfg=dict(filter_empty_gt=False, min_size=32),
-                ann_file='coco_annotations/DV_train_rgb.json',
-                data_prefix=dict(img='train/rgb/images/')
-            ),
-            dict(
-               _delete_=True,
-                type=dataset_type,
-                data_root=data_root,
-                metainfo=metainfo,
-                return_classes=True,
-                pipeline=train_pipeline,
-                filter_cfg=dict(filter_empty_gt=False, min_size=32),
-                ann_file='coco_annotations/DV_train_ir.json',
-                data_prefix=dict(img='train/ir/images/'),
-            ),
-        ]
-    )
-)
 
 val_pipeline = [
     dict(type='LoadMultiChannelImageFromFiles'),

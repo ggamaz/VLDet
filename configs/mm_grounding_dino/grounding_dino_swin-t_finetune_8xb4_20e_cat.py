@@ -1,6 +1,6 @@
 _base_ = 'grounding_dino_swin-t_pretrain_obj365.py'
 
-data_root = 'data/cat/'
+data_root = '/home/legion/Pictures/coco_cat/'
 class_name = ('cat', )
 num_classes = len(class_name)
 metainfo = dict(classes=class_name, palette=[(220, 20, 60)])
@@ -70,7 +70,7 @@ val_dataloader = dict(
 
 test_dataloader = val_dataloader
 
-val_evaluator = dict(ann_file=data_root + 'annotations/test.json')
+val_evaluator = dict(ann_file=data_root + 'annotations/test.json', classwise=True)
 test_evaluator = val_evaluator
 
 max_epoch = 20

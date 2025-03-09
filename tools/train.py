@@ -12,7 +12,7 @@ from mmdet.utils import setup_cache_size_limit_of_dynamo
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Train a detector')
-    parser.add_argument('config', help='train config file path')
+    parser.add_argument('--config', default='local_configs/grounding_dino_swin-t_finetune_8xb4_20e_cat.py', help='train config file path')
     parser.add_argument('--work-dir', help='the dir to save logs and models')
     parser.add_argument(
         '--amp',
