@@ -133,6 +133,9 @@ class LoadMultiChannelImageFromFiles(BaseTransform):
                     img_bytes,
                     flag=self.color_type,
                     backend=self.imdecode_backend))
+            assert isinstance(img[-1], np.ndarray), f'hope to get np.ndarry, but got {type(img[-1])} from {name}'
+            if len(img[-1].shape) != 3:
+                print(name, img[-1].shape)
         img = np.concatenate(img, axis=-1) # H, W, concatC
         # img = np.stack(img, axis=-1) # H, W, C, stack
         if self.to_float32:

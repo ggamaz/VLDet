@@ -54,6 +54,7 @@ class GroundingDINO(DINO):
 
     def __init__(self,
                  language_model,
+                 vision_fusion,
                  *args,
                  use_autocast=False,
                  **kwargs) -> None:
@@ -61,6 +62,7 @@ class GroundingDINO(DINO):
         self.language_model_cfg = language_model
         self._special_tokens = '. '
         self.use_autocast = use_autocast
+        self.vision_fusion_cfg = vision_fusion
         super().__init__(*args, **kwargs)
 
     def _init_layers(self) -> None:
@@ -87,7 +89,15 @@ class GroundingDINO(DINO):
             self.language_model.language_backbone.body.language_dim,
             self.embed_dims,
             bias=True)
-
+        
+        from fairscale.nn.checkpoint import checkpoint_wrapper
+        from mmdet.models.utils.vlfuse_helper import SingleScaleBiAttentionBlock
+        self.num_fusion_layers = self.vision_fusion_cfg.pop('num_layers', 2)
+        if checkpoint_wrapper:
+            self.vision_fuse_layers = nn.ModuleList(
+                [checkpoint_wrapper(SingleScaleBiAttentionBlock(**self.vision_fusion_cfg)) 
+                    for _ in range(self.num_fusion_layers)])
+            
     def init_weights(self) -> None:
         """Initialize weights for Transformer and other components."""
         super().init_weights()
@@ -541,6 +551,9 @@ class GroundingDINO(DINO):
 
         # image feature extraction
         visual_feats = self.extract_feat(batch_inputs)
+        
+        # multi-channel image feature fusion
+        visual_feats = self.fuse_vision_feat(visual_feats, batch_data_samples)
 
         if isinstance(text_prompts[0], list):
             # chunked text prompts, only bs=1 is supported
@@ -633,10 +646,50 @@ class GroundingDINO(DINO):
         visual_feats = super().extract_feat(batch_inputs)
 
         #multi-channel image feature extraction post-processing
-        N = visual_feats[0].shape[0] // 2
-        _visual_feats = []
-        for i in range(len(visual_feats)):
-            _visual_feats.append(visual_feats[i].reshape(N, 2, *visual_feats[i].shape[1:]).sum(dim=1, keepdim=False)/2)
-        visual_feats = tuple(_visual_feats)
+        # N = visual_feats[0].shape[0] // 2
+        # _visual_feats = []
+        # for i in range(len(visual_feats)):
+        #     _visual_feats.append(visual_feats[i].reshape(N, 2, *visual_feats[i].shape[1:]).sum(dim=1, keepdim=False)/2)
+        # visual_feats = tuple(_visual_feats)
         
         return visual_feats
+
+    def fuse_vision_feat(self, visual_feats: Tuple[Tensor], batch_data_samples) -> Tensor:
+        """
+        multi-channel image feature fusion
+        """
+        #preprocess
+        N = visual_feats[0].shape[0] // 2
+        _visual_feats = [[], []]
+        for i in range(len(visual_feats)):
+            _visual_feats[0].append(visual_feats[i][:N, ...])
+            _visual_feats[1].append(visual_feats[i][N:, ...])
+            
+        encoder_inputs_dicts = []
+        # decoder_inputs_dicts = []
+        for img_feat in  _visual_feats:
+            img_feat = tuple(img_feat)
+            encoder_inputs_dict, decoder_inputs_dict = self.pre_transformer(
+                img_feat, batch_data_samples)
+            encoder_inputs_dicts.append(encoder_inputs_dict)
+            # decoder_inputs_dicts.append(decoder_inputs_dict)
+        # fusion
+        vif,iif = encoder_inputs_dicts[0]['feat'],encoder_inputs_dicts[1]['feat']
+
+        for layer_id in range(len(self.vision_fuse_layers)):
+             vif, iif = self.vision_fuse_layers[layer_id](
+                    visual_feature=vif,
+                    lang_feature=iif,
+                    attention_mask_v=None,
+                    attention_mask_l=None,
+                )
+        
+        fusion_feats = ((vif + iif) / 2).permute(0,2,1)
+        res_feats =[]
+        start = 0
+        for vf in visual_feats:
+            N,c,h,w = vf.shape
+            N = N // 2
+            res_feats.append(fusion_feats[:, :, start:start+h*w].view([N, c, h, w]))
+            start += h*w
+        return tuple(res_feats)

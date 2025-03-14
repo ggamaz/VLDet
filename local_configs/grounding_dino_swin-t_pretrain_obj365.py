@@ -55,6 +55,13 @@ model = dict(
         bias=True,
         norm_cfg=dict(type='GN', num_groups=32),
         num_outs=4),
+    vision_fusion=dict(
+        num_layers=2,
+        v_dim=256,
+        l_dim=256,
+        embed_dim=1024,
+        num_heads=4,
+        init_values=1e-4),
     encoder=dict(
         num_layers=6,
         num_cp=6,
@@ -201,7 +208,7 @@ coco_od_dataset = dict(
 
 train_dataloader = dict(
     _delete_=True,
-    batch_size=4,
+    batch_size=8,
     num_workers=4,
     persistent_workers=True,
     sampler=dict(type='DefaultSampler', shuffle=True),
