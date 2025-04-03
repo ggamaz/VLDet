@@ -2,7 +2,7 @@
 import copy
 import re
 import warnings
-from typing import Dict, Optional, Tuple, Union
+from typing import Dict, Optional, Tuple, Union, List
 
 import torch
 import torch.nn as nn
@@ -90,13 +90,13 @@ class GroundingDINO(DINO):
             self.embed_dims,
             bias=True)
         
-        from fairscale.nn.checkpoint import checkpoint_wrapper
-        from mmdet.models.utils.vlfuse_helper import SingleScaleBiAttentionBlock
-        self.num_fusion_layers = self.vision_fusion_cfg.pop('num_layers', 2)
-        if checkpoint_wrapper:
-            self.vision_fuse_layers = nn.ModuleList(
-                [checkpoint_wrapper(SingleScaleBiAttentionBlock(**self.vision_fusion_cfg)) 
-                    for _ in range(self.num_fusion_layers)])
+        # from fairscale.nn.checkpoint import checkpoint_wrapper
+        # from mmdet.models.utils.vlfuse_helper import SingleScaleBiAttentionBlock
+        # self.num_fusion_layers = self.vision_fusion_cfg.pop('num_layers', 2)
+        # if checkpoint_wrapper:
+        #     self.vision_fuse_layers = nn.ModuleList(
+        #         [checkpoint_wrapper(SingleScaleBiAttentionBlock(**self.vision_fusion_cfg)) 
+        #             for _ in range(self.num_fusion_layers)])
             
     def init_weights(self) -> None:
         """Initialize weights for Transformer and other components."""
@@ -316,12 +316,21 @@ class GroundingDINO(DINO):
         text_dict: Dict,
         batch_data_samples: OptSampleList = None,
     ) -> Dict:
-        encoder_inputs_dict, decoder_inputs_dict = self.pre_transformer(
-            img_feats, batch_data_samples)
 
-        encoder_outputs_dict = self.forward_encoder(
-            **encoder_inputs_dict, text_dict=text_dict)
+        vi_feats = img_feats[0]
+        ii_feats = img_feats[1]
+        del img_feats
+        res = []
+        for img_feats in [vi_feats, ii_feats]:
+            encoder_inputs_dict, decoder_inputs_dict = self.pre_transformer(
+                img_feats, batch_data_samples)
 
+            encoder_outputs_dict = self.forward_encoder(
+                **encoder_inputs_dict, text_dict=text_dict)
+            res.append(encoder_outputs_dict)
+    
+        encoder_outputs_dict = self.feats_fuse(res[0], res[1])
+        
         tmp_dec_in, head_inputs_dict = self.pre_decoder(
             **encoder_outputs_dict, batch_data_samples=batch_data_samples)
         decoder_inputs_dict.update(tmp_dec_in)
@@ -551,9 +560,6 @@ class GroundingDINO(DINO):
 
         # image feature extraction
         visual_feats = self.extract_feat(batch_inputs)
-        
-        # multi-channel image feature fusion
-        visual_feats = self.fuse_vision_feat(visual_feats, batch_data_samples)
 
         if isinstance(text_prompts[0], list):
             # chunked text prompts, only bs=1 is supported
@@ -572,8 +578,7 @@ class GroundingDINO(DINO):
                     text_dict['embedded'] = self.text_feat_map(
                         text_dict['embedded'])
 
-                batch_data_samples[
-                    0].token_positive_map = token_positive_maps_once
+                batch_data_samples[0].token_positive_map = token_positive_maps_once
 
                 head_inputs_dict = self.forward_transformer(
                     copy.deepcopy(visual_feats), text_dict, batch_data_samples)
@@ -644,52 +649,62 @@ class GroundingDINO(DINO):
 
         # image feature extraction
         visual_feats = super().extract_feat(batch_inputs)
-
-        #multi-channel image feature extraction post-processing
-        # N = visual_feats[0].shape[0] // 2
-        # _visual_feats = []
-        # for i in range(len(visual_feats)):
-        #     _visual_feats.append(visual_feats[i].reshape(N, 2, *visual_feats[i].shape[1:]).sum(dim=1, keepdim=False)/2)
-        # visual_feats = tuple(_visual_feats)
         
-        return visual_feats
-
-    def fuse_vision_feat(self, visual_feats: Tuple[Tensor], batch_data_samples) -> Tensor:
-        """
-        multi-channel image feature fusion
-        """
-        #preprocess
+        #multi-channel image feature extraction post-processing : fusion
         N = visual_feats[0].shape[0] // 2
         _visual_feats = [[], []]
         for i in range(len(visual_feats)):
             _visual_feats[0].append(visual_feats[i][:N, ...])
             _visual_feats[1].append(visual_feats[i][N:, ...])
-            
-        encoder_inputs_dicts = []
-        # decoder_inputs_dicts = []
-        for img_feat in  _visual_feats:
-            img_feat = tuple(img_feat)
-            encoder_inputs_dict, decoder_inputs_dict = self.pre_transformer(
-                img_feat, batch_data_samples)
-            encoder_inputs_dicts.append(encoder_inputs_dict)
-            # decoder_inputs_dicts.append(decoder_inputs_dict)
-        # fusion
-        vif,iif = encoder_inputs_dicts[0]['feat'],encoder_inputs_dicts[1]['feat']
-
-        for layer_id in range(len(self.vision_fuse_layers)):
-             vif, iif = self.vision_fuse_layers[layer_id](
-                    visual_feature=vif,
-                    lang_feature=iif,
-                    attention_mask_v=None,
-                    attention_mask_l=None,
-                )
         
-        fusion_feats = ((vif + iif) / 2).permute(0,2,1)
-        res_feats =[]
-        start = 0
-        for vf in visual_feats:
-            N,c,h,w = vf.shape
-            N = N // 2
-            res_feats.append(fusion_feats[:, :, start:start+h*w].view([N, c, h, w]))
-            start += h*w
+        return _visual_feats[0], _visual_feats[1]
+        
+        # vif = self.pre_fusion(_visual_feats[0])
+        # iif = self.pre_fusion(_visual_feats[1]) # bs, c, concat(h*w)
+
+        # for layer_id in range(len(self.vision_fuse_layers)):
+        #      vif, iif = self.vision_fuse_layers[layer_id](
+        #             visual_feature=vif,
+        #             lang_feature=iif,
+        #             attention_mask_v=None,
+        #             attention_mask_l=None,
+        #         )
+        # fusion_feats = ((vif + iif) / 2).permute(0,2,1)
+        # res_feats =[]
+        # start = 0
+        # for vf in visual_feats:
+        #     N,c,h,w = vf.shape
+        #     N = N // 2
+        #     res_feats.append(fusion_feats[:, :, start:start+h*w].view([N, c, h, w]))
+        #     start += h*w
         return tuple(res_feats)
+
+    def pre_fusion(self, mlvl_feats: List[Tensor]):
+        mlvl_pos_embeds = []
+        for feat in mlvl_feats:
+            mlvl_pos_embeds.append(
+                self.positional_encoding(None, input=feat))
+        
+        feat_flatten = []
+        lvl_pos_embed_flatten = []
+        for lvl, (feat, pos_embed) in enumerate(zip(mlvl_feats, mlvl_pos_embeds)):
+            batch_size, c, h, w = feat.shape
+           
+            feat = feat.view(batch_size, c, -1).permute(0, 2, 1) # [bs, c, h_lvl, w_lvl] -> [bs, h_lvl*w_lvl, c]
+            pos_embed = pos_embed.view(batch_size, c, -1).permute(0, 2, 1)
+            lvl_pos_embed = pos_embed + self.level_embed[lvl].view(1, 1, -1)# [bs, h_lvl, w_lvl] -> [bs, h_lvl*w_lvl]
+            
+
+            feat_flatten.append(feat)
+            lvl_pos_embed_flatten.append(lvl_pos_embed)
+        # (bs, num_feat_points, dim)
+        feat_flatten = torch.cat(feat_flatten, 1) # [bs, c, concat(h_lvl*w_lvl)]
+        lvl_pos_embed_flatten = torch.cat(lvl_pos_embed_flatten, 1)
+        
+        return feat_flatten
+    
+    def feats_fuse(self, vi_encoder_dict, ii_encoder_dict):
+        vi_encoder_dict['memory'] = vi_encoder_dict['memory']/2 + ii_encoder_dict['memory']/2
+        vi_encoder_dict['memory_text'] = vi_encoder_dict['memory_text']/2 + ii_encoder_dict['memory_text']/2
+        return vi_encoder_dict
+        

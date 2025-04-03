@@ -56,6 +56,8 @@ train_pipeline = [
 ]
 
 train_dataloader = dict(
+    batch_size=8,
+    num_workers=8,
     dataset=dict(
         _delete_=True,
         type=dataset_type,
