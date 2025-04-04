@@ -3890,14 +3890,15 @@ class SpiltMultiChannel(BaseTransform):
     def transform(self, results:dict) -> dict:
         img: np.array = results.pop('img')
         start = 0
+        imgs = []
         for channel in self.each_channels:
             _results = copy.deepcopy(results)
             _results['img'] = img[:, :, start:start+channel]
             for t in self.transforms:
                 _results = t(_results)
-            img[:, :, start:start+channel] = _results['img']
+            imgs.append(_results['img'])
             start += channel
-        _results['img'] = img
+        _results['img'] = np.concatenate(imgs, axis=-1)
         return _results
     
     def __repr__(self):
