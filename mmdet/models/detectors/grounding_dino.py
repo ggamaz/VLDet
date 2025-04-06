@@ -47,7 +47,7 @@ class FusionConfig:
         self.num_experts_per_tok = 2
         self.dim = 256
         self.h_dim = 512
-        self.aux_loss_alpha = 0.1
+        self.aux_loss_alpha = 0.3
         self.seq_aux = False
         self.norm_topk_prob = True
 
@@ -63,8 +63,8 @@ class FeedForwardFusion(nn.Module):
     
     def _init_layers(self) -> None:
         import torch.nn.init as init
-        init.eye_(self.w1.weight)
-        init.constant_(self.w2.weight, 0.0)
+        init.constant_(self.w1.weight, 0.0)
+        init.eye_(self.w2.weight)
         init.eye_(self.w3.weight)
         
     def forward(self, x: Tensor):
@@ -169,7 +169,7 @@ class MOEFuse(nn.Module):
         self.aux_loss = aux_loss
         return y
 
-    # @torch.no_grad()
+    @torch.no_grad()
     def moe_infer(self, x, flat_expert_indices, flat_expert_weights):
         dim = x.shape[-1]//2
         expert_cache = torch.zeros(*x.shape[:-1], dim, device=x.device, dtype=x.dtype)
@@ -244,7 +244,8 @@ class GroundingDINO(DINO):
         from fairscale.nn.checkpoint import checkpoint_wrapper
         if checkpoint_wrapper:
             config = FusionConfig()
-            self.vision_fuse = checkpoint_wrapper(MOEFuse(config))
+            # self.vision_fuse = checkpoint_wrapper(MOEFuse(config))
+            self.vision_fuse = MOEFuse(config)
             
     def init_weights(self) -> None:
         """Initialize weights for Transformer and other components."""
@@ -467,7 +468,6 @@ class GroundingDINO(DINO):
 
         vi_feats = img_feats[0]
         ii_feats = img_feats[1]
-        res = []
 
         encoder_inputs_dict, decoder_inputs_dict = self.pre_transformer(
             vi_feats, batch_data_samples)
@@ -481,7 +481,6 @@ class GroundingDINO(DINO):
             ii_feats, batch_data_samples)
         ii_encoder_outputs_dict = self.forward_encoder(
             **encoder_inputs_dict, text_dict=text_dict)
-
         encoder_outputs_dict['memory_text'] = ii_encoder_outputs_dict['memory_text']
         encoder_outputs_dict['memory'] = self.feats_fuse(encoder_outputs_dict['memory'], ii_encoder_outputs_dict['memory'])
         
@@ -672,6 +671,7 @@ class GroundingDINO(DINO):
 
         losses = self.bbox_head.loss(
             **head_inputs_dict, batch_data_samples=batch_data_samples)
+        losses['aux_loss'] = self.vision_fuse.aux_loss
         return losses
 
     def predict(self, batch_inputs, batch_data_samples, rescale: bool = True):

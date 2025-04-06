@@ -247,3 +247,4 @@ train_cfg = dict(
 auto_scale_lr = dict(base_batch_size=64)
 
 default_hooks = dict(visualization=dict(type='GroundingVisualizationHook'))
+find_unused_parameters = False
