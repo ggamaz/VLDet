@@ -320,8 +320,6 @@ class GroundingDINO(DINO):
         text_dict: Dict,
         batch_data_samples: OptSampleList = None,
     ) -> Dict:
-        import ipdb
-        ipdb.set_trace()
         vi_feats, ii_feats = img_feats
         
         """

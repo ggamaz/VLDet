@@ -1,44 +1,20 @@
 _base_ = 'grounding_dino_swin-t_pretrain_obj365.py'
 
-data_root = '/root/autodl-tmp/'
+data_root = '/root/autodl-tmp/DroneVehicleBorder/'
 backend_args = None
-dataset_type = 'PairedCocoDataset'
 
 
 model = dict(
-    bbox_head=dict(num_classes=11),
-    
     fusion_module = dict(
-        use_fusion=True,
-        
-        type ="msd",
-        msd_cfg=dict(
-            num_layers=4,
-            layer_cfg=dict(
-                self_attn_cfg=dict(embed_dims=256, num_levels=4, dropout=0.0),
-                ffn_cfg=dict(
-                    embed_dims=256, feedforward_channels=2048, ffn_drop=0.0)
-            )
-        ),
-        position="after_backbone",
+      use_fusion=False,
+      type ="moe",
+      position="after_backbone",  
     ),
-    
-    data_preprocessor=dict(
-        type='DetMultiChannelDataPreprocessor',
-        mean=[123.675, 116.28, 103.53, 123.675, 116.28, 103.53],
-        std=[58.395, 57.12, 57.375, 58.395, 57.12, 57.375],
-        bgr_to_rgb=True,
-        pad_mask=False,
-    ),
+    bbox_head=dict(num_classes=11)
 )
 
-
 train_pipeline = [
-    dict(
-        type='LoadMultiChannelImageFromFiles',
-        color_type='color',
-        backend_args=None,
-        imdecode_backend='cv2'),
+    dict(type='LoadImageFromFile'),
     dict(type='LoadAnnotations', with_bbox=True),
     dict(type='RandomFlip', prob=0.5),
     dict(
@@ -79,97 +55,46 @@ train_pipeline = [
                    'custom_entities'))
 ]
 
-datasets = [
-    # dict(
-    #     type='PairedCocoDataset',
-    #     metainfo=dict(
-    #         classes=("Bus", "Car", "Lamp", "Motorcycle", "People", "Truck"),
-    #         palette=[
-    #             (0, 0, 255), (255, 0, 0), (0, 255, 0), (255, 255, 0),
-    #             (255, 0, 255), (0, 255, 255)
-    #         ],
-    #     ),
-    #     data_root=data_root+'M3FD_Detection/',
-    #     return_classes=True,
-    #     pipeline=train_pipeline,
-    #     filter_cfg=dict(filter_empty_gt=False, min_size=32),
-    #     ann_file='annotations/instances_default.json',
-    #     data_prefix=dict(imga='vi',imgb='ir')
-    # ),
-    dict(
-        metainfo = dict(
-            classes= ('car', 'bus', 'freight_car', 'truck', 'van'),
-            palette=[(220, 20, 60), (119, 11, 32), (0, 0, 142), (0, 0, 230), (106, 0, 228),]
-        ),
-        type='PairedCocoDataset',
-        data_root= data_root+'DroneVehicleBorder/',
-        return_classes=True,
-        pipeline=train_pipeline,
-        filter_cfg=dict(filter_empty_gt=False, min_size=32),
-        ann_file='coco_annotations/DV_train_ir.json',
-        data_prefix=dict(imga='train/rgb/images/',imgb='train/ir/images/')
-    )
-]
-
 train_dataloader = dict(
     batch_size=8,
     num_workers=4,
     dataset=dict(
         _delete_=True,
-        type='ConcatDataset',
-        datasets=datasets,
+        type='CocoDataset',
+        data_root=data_root,
+        metainfo = dict(
+            classes= ('car', 'bus', 'freight_car', 'truck', 'van'),
+            palette=[(220, 20, 60), (119, 11, 32), (0, 0, 142), (0, 0, 230), (106, 0, 228),]
+        ),
+        return_classes=True,
+        pipeline=train_pipeline,
+        filter_cfg=dict(filter_empty_gt=False, min_size=32),
+        ann_file='coco_annotations/DV_train_ir.json',
+        data_prefix=dict(img='train/ir/images/')
     )
 )
-
-test_pipeline = [
-    dict(
-        type='LoadMultiChannelImageFromFiles',
-        color_type='color',
-        backend_args=None,
-        imdecode_backend='cv2'),
-    dict(
-        type='SpiltMultiChannel',
-        channels=[3, 3],
-        transforms=[
-            dict(
-                type='FixScaleResize',
-                scale=(512, 640),
-                keep_ratio=True,
-                backend='pillow'),
-            ]),
-    dict(type='LoadAnnotations', with_bbox=True),
-    dict(
-        type='PackDetInputs',
-        meta_keys=('img_id', 'img_path', 'ori_shape', 'img_shape',
-                   'scale_factor', 'text', 'custom_entities',
-                   'tokens_positive'))
-]
 
 val_dataloader = dict(
     batch_size=4,
     num_workers=2,
-    persistent_workers=True,
-    drop_last=False,
     dataset=dict(
-        _delete_=True,
-        type='PairedCocoDataset',
-        return_classes=True,
-        pipeline=test_pipeline,
-        data_root=data_root+'DroneVehicleBorder/',
+        metainfo = dict(
+            classes= ('car', 'bus', 'freight_car', 'truck', 'van'),
+            palette=[(220, 20, 60), (119, 11, 32), (0, 0, 142), (0, 0, 230), (106, 0, 228),]
+        ),
+        data_root=data_root,
         ann_file='coco_annotations/DV_test_ir.json',
-        data_prefix=dict(imga='test/rgb/images/',imgb='test/ir/images/'),
-        # ann_file='annotations/instances_default.json',
-        # data_prefix=dict(imga='vi',imgb='ir')
+        data_prefix=dict(img='test/ir/images/'),
     )
 )
 
 test_dataloader = val_dataloader
 
-val_evaluator = dict(ann_file=data_root+'DroneVehicleBorder/coco_annotations/DV_test_ir.json',)
+val_evaluator = dict(ann_file=data_root+'coco_annotations/DV_test_ir.json',)
 # val_evaluator = dict(ann_file=data_root + 'annotations/instances_default.json')
 test_evaluator = val_evaluator
 
-max_epoch = 20
+max_epoch = 16
 
 default_hooks = dict(
     checkpoint=dict(interval=1, max_keep_ckpts=1, save_best='auto'),
@@ -193,9 +118,6 @@ optim_wrapper = dict(
             'absolute_pos_embed': dict(decay_mult=0.),
             'backbone': dict(lr_mult=0.0),
             'language_model': dict(lr_mult=0.0),
-            # 'encoder': dict(lr_mult=0.0),
-            # 'decoder': dict(lr_mult=0.0),
-            # 'bbox_head': dict(lr_mult=0.0),
         }))
 
 load_from = 'https://download.openmmlab.com/mmdetection/v3.0/mm_grounding_dino/grounding_dino_swin-t_pretrain_obj365_goldg_grit9m_v3det/grounding_dino_swin-t_pretrain_obj365_goldg_grit9m_v3det_20231204_095047-b448804b.pth'  # noqa
