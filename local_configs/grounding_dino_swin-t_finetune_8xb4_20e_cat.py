@@ -1,11 +1,29 @@
 _base_ = 'grounding_dino_swin-t_pretrain_obj365.py'
 
-data_root = '/root/autodl-tmp/'
+data_root = '/home/legion/Pictures/'
 backend_args = None
 dataset_type = 'PairedCocoDataset'
 
 
-model = dict(bbox_head=dict(num_classes=11))
+model = dict(
+    bbox_head=dict(num_classes=11),
+    
+    fusion_module = dict(
+        use_fusion=True,
+        
+        type ="msd",
+        msd_cfg=dict(
+            num_layers=2,
+            layer_cfg=dict(
+                self_attn_cfg=dict(embed_dims=256, num_levels=4, dropout=0.0),
+                ffn_cfg=dict(
+                    embed_dims=256, feedforward_channels=2048, ffn_drop=0.0)
+            )
+        ),
+        position="after_backbone",
+    ),
+)
+
 
 train_pipeline = [
     dict(
@@ -54,22 +72,22 @@ train_pipeline = [
 ]
 
 datasets = [
-    dict(
-        type='PairedCocoDataset',
-        metainfo=dict(
-            classes=("Bus", "Car", "Lamp", "Motorcycle", "People", "Truck"),
-            palette=[
-                (0, 0, 255), (255, 0, 0), (0, 255, 0), (255, 255, 0),
-                (255, 0, 255), (0, 255, 255)
-            ],
-        ),
-        data_root=data_root+'M3FD_Detection/',
-        return_classes=True,
-        pipeline=train_pipeline,
-        filter_cfg=dict(filter_empty_gt=False, min_size=32),
-        ann_file='annotations/instances_default.json',
-        data_prefix=dict(imga='vi',imgb='ir')
-    ),
+    # dict(
+    #     type='PairedCocoDataset',
+    #     metainfo=dict(
+    #         classes=("Bus", "Car", "Lamp", "Motorcycle", "People", "Truck"),
+    #         palette=[
+    #             (0, 0, 255), (255, 0, 0), (0, 255, 0), (255, 255, 0),
+    #             (255, 0, 255), (0, 255, 255)
+    #         ],
+    #     ),
+    #     data_root=data_root+'M3FD_Detection/',
+    #     return_classes=True,
+    #     pipeline=train_pipeline,
+    #     filter_cfg=dict(filter_empty_gt=False, min_size=32),
+    #     ann_file='annotations/instances_default.json',
+    #     data_prefix=dict(imga='vi',imgb='ir')
+    # ),
     dict(
         metainfo = dict(
             classes= ('car', 'bus', 'freight_car', 'truck', 'van'),

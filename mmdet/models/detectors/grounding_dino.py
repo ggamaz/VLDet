@@ -18,8 +18,9 @@ from ..layers.transformer.grounding_dino_layers import (
 from .dino import DINO
 from .glip import (create_positive_map, create_positive_map_label_to_token,
                    run_ner)
+import torch.nn.functional as F
 
-
+from einops import rearrange
 def clean_label_name(name: str) -> str:
     name = re.sub(r'\(.*\)', '', name)
     name = re.sub(r'_', ' ', name)
@@ -40,160 +41,8 @@ def chunks(lst: list, n: int) -> list:
 
     return all_
 
-class FusionConfig:
-   def __init__(self):
-        self.n_routed_experts = 4
-        self.n_shared_experts = None
-        self.num_experts_per_tok = 2
-        self.dim = 256
-        self.h_dim = 512
-        self.aux_loss_alpha = 0.3
-        self.seq_aux = False
-        self.norm_topk_prob = True
 
-       
-class FeedForwardFusion(nn.Module):
-    def __init__(self, in_channels,hidden_channels):
-        super().__init__()
-        self.gate = nn.SELU()
-        self.w1 = nn.Linear(in_channels, hidden_channels)
-        self.w2 = nn.Linear(in_channels, hidden_channels)
-        self.w3 = nn.Linear(hidden_channels, in_channels)
-        self._init_layers()
-    
-    def _init_layers(self) -> None:
-        import torch.nn.init as init
-        init.constant_(self.w1.weight, 0.0)
-        init.eye_(self.w2.weight)
-        init.eye_(self.w3.weight)
-        
-    def forward(self, x: Tensor):
-        dim = x.shape[-1]
-        a = x[..., :dim//2]
-        b = x[..., dim//2:]
-        gate = self.gate(self.w1(b))
-        return self.w3(self.w2(a) + self.w2(b) * gate)
-    
-import math
-import torch.nn.functional as F
-class MoEGate(nn.Module):
-    def __init__(self, num_experts_per_tok,n_routed_experts,aux_loss_alpha,seq_aux,norm_topk_prob,dim):
-        super().__init__()
-        self.top_k = num_experts_per_tok
-        self.n_routed_experts = n_routed_experts
-
-        self.scoring_func = 'softmax'
-        self.alpha = aux_loss_alpha
-        self.seq_aux = seq_aux
-
-        self.norm_topk_prob = norm_topk_prob
-        self.gating_dim = dim
-        self.linear = nn.Linear(self.gating_dim, self.n_routed_experts)
-        self.reset_parameters()
-
-    def reset_parameters(self) -> None:
-        import torch.nn.init as init
-        init.kaiming_uniform_(self.linear.weight, a=math.sqrt(5))
-
-    def forward(self, hidden_states: Tensor):
-        bsz, seq_len, h = hidden_states.shape
-        hidden_states = hidden_states.view(-1, h)
-        logits = self.linear(hidden_states)
-        if self.scoring_func == 'softmax':
-            scores = logits.softmax(dim=-1)
-        else:
-            raise NotImplementedError(f'insupportable scoring function for MoE gating: {self.scoring_func}')
-
-        topk_weight, topk_idx = torch.topk(scores, k=self.top_k, dim=-1, sorted=False)
-
-        if self.top_k > 1 and self.norm_topk_prob:
-            denominator = topk_weight.sum(dim=-1, keepdim=True) + 1e-20
-            topk_weight = topk_weight / denominator
-
-        if self.training and self.alpha > 0.0:
-            scores_for_aux = scores
-            aux_topk = self.top_k
-            topk_idx_for_aux_loss = topk_idx.view(bsz, -1)
-            if self.seq_aux:
-                scores_for_seq_aux = scores_for_aux.view(bsz, seq_len, -1)
-                ce = torch.zeros(bsz, self.n_routed_experts, device=hidden_states.device)
-                ce.scatter_add_(1, topk_idx_for_aux_loss,
-                                torch.ones(bsz, seq_len * aux_topk, device=hidden_states.device)).div_(
-                    seq_len * aux_topk / self.n_routed_experts)
-                aux_loss = (ce * scores_for_seq_aux.mean(dim=1)).sum(dim=1).mean() * self.alpha
-            else:
-                mask_ce = F.one_hot(topk_idx_for_aux_loss.view(-1), num_classes=self.n_routed_experts)
-                ce = mask_ce.float().mean(0)
-                Pi = scores_for_aux.mean(0)
-                fi = ce * self.n_routed_experts
-                aux_loss = (Pi * fi).sum() * self.alpha
-        else:
-            aux_loss = 0
-        return topk_idx, topk_weight, aux_loss
-
-
-class MOEFuse(nn.Module):
-    def __init__(self, config: FusionConfig):
-        super().__init__()
-        self.config = config
-        self.experts = nn.ModuleList([
-            FeedForwardFusion(config.dim, config.h_dim)
-            for _ in range(config.n_routed_experts)
-        ])
-        self.gate = MoEGate(config.num_experts_per_tok, config.n_routed_experts, config.aux_loss_alpha, config.seq_aux, config.norm_topk_prob, config.dim*2)
-        if config.n_shared_experts is not None:
-            self.shared_experts = FeedForwardFusion(config.dim, config.h_dim)
-
-    def forward(self, vx:torch.Tensor, ix:torch.Tensor):
-        x = torch.cat([vx, ix], dim=-1)
-        identity = x
-        orig_shape = vx.shape
-        bsz, seq_len, _ = x.shape
-        # 使用门控机制选择专家
-        topk_idx, topk_weight, aux_loss = self.gate(x)
-        x = x.view(-1, x.shape[-1])
-        flat_topk_idx = topk_idx.view(-1)
-        if self.training:
-            # 训练模式下，重复输入数据
-            x = x.repeat_interleave(self.config.num_experts_per_tok, dim=0)
-            y = torch.empty([*x.shape[:-1],vx.shape[-1]], dtype=x.dtype, device=x.device)
-            for i, expert in enumerate(self.experts):
-                y[flat_topk_idx == i] = expert(x[flat_topk_idx == i]).to(y.dtype)  # 确保类型一致
-            y = (y.view(*topk_weight.shape, -1) * topk_weight.unsqueeze(-1)).sum(dim=1)
-            y = y.view(*orig_shape)
-        else:
-            # 推理模式下，只选择最优专家
-            y = self.moe_infer(x=x, flat_expert_indices=flat_topk_idx, flat_expert_weights=topk_weight.view(-1, 1)).view(*orig_shape)
-        if self.config.n_shared_experts is not None:
-            y = y + self.shared_experts(identity)
-        self.aux_loss = aux_loss
-        return y
-
-    @torch.no_grad()
-    def moe_infer(self, x, flat_expert_indices, flat_expert_weights):
-        dim = x.shape[-1]//2
-        expert_cache = torch.zeros(*x.shape[:-1], dim, device=x.device, dtype=x.dtype)
-        idxs = flat_expert_indices.argsort()
-        tokens_per_expert = flat_expert_indices.bincount().cpu().numpy().cumsum(0)
-        token_idxs = idxs // self.config.num_experts_per_tok
-        # 例如当tokens_per_expert=[6, 15, 20, 26, 33, 38, 46, 52]
-        # 当token_idxs=[3, 7, 19, 21, 24, 25,  4,  5,  6, 10, 11, 12...]
-        # 意味着当token_idxs[:6] -> [3,  7, 19, 21, 24, 25,  4]位置的token都由专家0处理，token_idxs[6:15]位置的token都由专家1处理......
-        for i, end_idx in enumerate(tokens_per_expert):
-            start_idx = 0 if i == 0 else tokens_per_expert[i - 1]
-            if start_idx == end_idx:
-                continue
-            expert = self.experts[i]
-            exp_token_idx = token_idxs[start_idx:end_idx]
-            expert_tokens = x[exp_token_idx]
-            expert_out = expert(x=expert_tokens).to(expert_cache.dtype)
-            expert_out.mul_(flat_expert_weights[idxs[start_idx:end_idx]])
-            # 使用 scatter_add_ 进行 sum 操作
-            expert_cache.scatter_add_(0, exp_token_idx.view(-1, 1).repeat(1, dim), expert_out)
-
-        return expert_cache
-
-
+from ..layers.transformer.grounding_dino_layers import MSDeformableVisionFuser, MoEFuser
 @MODELS.register_module()
 class GroundingDINO(DINO):
     """Implementation of `Grounding DINO: Marrying DINO with Grounded Pre-
@@ -206,11 +55,13 @@ class GroundingDINO(DINO):
     """
 
     def __init__(self,
+                 fusion_module,
                  language_model,
                  *args,
                  use_autocast=False,
                  **kwargs) -> None:
 
+        self.fusion_module_cfg = fusion_module
         self.language_model_cfg = language_model
         self._special_tokens = '. '
         self.use_autocast = use_autocast
@@ -240,12 +91,16 @@ class GroundingDINO(DINO):
             self.language_model.language_backbone.body.language_dim,
             self.embed_dims,
             bias=True)
-        
-        from fairscale.nn.checkpoint import checkpoint_wrapper
-        if checkpoint_wrapper:
-            config = FusionConfig()
-            # self.vision_fuse = checkpoint_wrapper(MOEFuse(config))
-            self.vision_fuse = MOEFuse(config)
+        if self.fusion_module_cfg['use_fusion']:
+            from fairscale.nn.checkpoint import checkpoint_wrapper
+            if self.fusion_module_cfg['type'] == 'moe':
+                if checkpoint_wrapper:
+                    # self.vision_fuse = checkpoint_wrapper(MOEFuse(config))
+                    self.vision_fuser = MoEFuser()
+            elif self.fusion_module_cfg['type'] == 'msd':
+                msd_cfg = self.fusion_module_cfg['msd_cfg']
+                self.vision_fuser = MSDeformableVisionFuser(**msd_cfg)
+
             
     def init_weights(self) -> None:
         """Initialize weights for Transformer and other components."""
@@ -461,28 +316,68 @@ class GroundingDINO(DINO):
 
     def forward_transformer(
         self,
-        img_feats: Tuple[Tensor],
+        img_feats: Union[Tensor, Tuple[Tensor]],
         text_dict: Dict,
         batch_data_samples: OptSampleList = None,
     ) -> Dict:
+        import ipdb
+        ipdb.set_trace()
+        vi_feats, ii_feats = img_feats
+        
+        """
+        feats fusion begin
+        """
+        if self.fusion_module_cfg['type']=='msd':
+            vif_dict, decoder_inputs_dict = self.pre_transformer(vi_feats, batch_data_samples=None)
+            iif_dict, _ = self.pre_transformer(ii_feats, batch_data_samples=None)
+            feat_fuse = self.vision_fuser(vif=vif_dict['feat'], vif_pos=vif_dict['feat_pos'],
+                                        iif=iif_dict['feat'], iif_pos=iif_dict['feat_pos'],
+                                        key_padding_mask=vif_dict['feat_mask'],
+                                        spatial_shapes=vif_dict['spatial_shapes'],
+                                        level_start_index=vif_dict['level_start_index'],
+                                        valid_ratios=vif_dict['valid_ratios']
+                                    )
+            vif_dict['feat'] = feat_fuse
+            encoder_inputs_dict = vif_dict
+        
+        elif self.fusion_module_cfg['type']=='add':
+            
+            feat_fuse = (vi_feats + ii_feats)/2
+            encoder_inputs_dict, decoder_inputs_dict = self.pre_transformer(
+                feat_fuse, batch_data_samples)
+        
+        elif self.fusion_module_cfg['type']=='moe':
+            
+            feat_fuse = self.vision_fuser(vi_feats, ii_feats)
+            encoder_inputs_dict, decoder_inputs_dict = self.pre_transformer(
+                feat_fuse, batch_data_samples)
+        """
+        feats fusion end
+        """
+        
+        # encoder_inputs_dict, decoder_inputs_dict = self.pre_transformer(
+        #     img_feats, batch_data_samples)
 
-        vi_feats = img_feats[0]
-        ii_feats = img_feats[1]
+        # ''' 
+        #     start of the post processing of concatenate visual features
+        # '''
+        # bs = len(batch_data_samples)
+        # encoder_inputs_dict['feat'] = rearrange(encoder_inputs_dict['feat'], '(b two) n c -> b (n two) c', two=2)
+        # encoder_inputs_dict['feat_pos'] = rearrange(encoder_inputs_dict['feat_pos'], '(b two) n c -> b (n two) c', two=2)
+        # encoder_inputs_dict['valid_ratios'] = encoder_inputs_dict['valid_ratios'][:bs]
+        # ''' 
+        #     end of the post processing of concatenate visual features
+        # '''
+        encoder_outputs_dict = self.forward_encoder(**encoder_inputs_dict, text_dict=text_dict)
 
-        encoder_inputs_dict, decoder_inputs_dict = self.pre_transformer(
-            vi_feats, batch_data_samples)
+        # text_dict['embedded'] = encoder_outputs_dict['memory_text']
 
-        encoder_outputs_dict = self.forward_encoder(
-            **encoder_inputs_dict, text_dict=text_dict)
-
-        text_dict['embedded'] = encoder_outputs_dict['memory_text']
-
-        encoder_inputs_dict, decoder_inputs_dict = self.pre_transformer(
-            ii_feats, batch_data_samples)
-        ii_encoder_outputs_dict = self.forward_encoder(
-            **encoder_inputs_dict, text_dict=text_dict)
-        encoder_outputs_dict['memory_text'] = ii_encoder_outputs_dict['memory_text']
-        encoder_outputs_dict['memory'] = self.feats_fuse(encoder_outputs_dict['memory'], ii_encoder_outputs_dict['memory'])
+        # encoder_inputs_dict, decoder_inputs_dict = self.pre_transformer(
+        #     ii_feats, batch_data_samples)
+        # ii_encoder_outputs_dict = self.forward_encoder(
+        #     **encoder_inputs_dict, text_dict=text_dict)
+        # encoder_outputs_dict['memory_text'] = ii_encoder_outputs_dict['memory_text']
+        # encoder_outputs_dict['memory'] = self.feats_fuse(encoder_outputs_dict['memory'], ii_encoder_outputs_dict['memory'])
         
         tmp_dec_in, head_inputs_dict = self.pre_decoder(
             **encoder_outputs_dict, batch_data_samples=batch_data_samples)
@@ -491,6 +386,131 @@ class GroundingDINO(DINO):
         decoder_outputs_dict = self.forward_decoder(**decoder_inputs_dict)
         head_inputs_dict.update(decoder_outputs_dict)
         return head_inputs_dict
+
+    def pre_transformer(
+            self,
+            mlvl_feats: Tuple[Tensor],
+            batch_data_samples: OptSampleList = None) -> Tuple[Dict]:
+        """Process image features before feeding them to the transformer.
+
+        The forward procedure of the transformer is defined as:
+        'pre_transformer' -> 'encoder' -> 'pre_decoder' -> 'decoder'
+        More details can be found at `TransformerDetector.forward_transformer`
+        in `mmdet/detector/base_detr.py`.
+
+        Args:
+            mlvl_feats (tuple[Tensor]): Multi-level features that may have
+                different resolutions, output from neck. Each feature has
+                shape (bs, dim, h_lvl, w_lvl), where 'lvl' means 'layer'.
+            batch_data_samples (list[:obj:`DetDataSample`], optional): The
+                batch data samples. It usually includes information such
+                as `gt_instance` or `gt_panoptic_seg` or `gt_sem_seg`.
+                Defaults to None.
+
+        Returns:
+            tuple[dict]: The first dict contains the inputs of encoder and the
+            second dict contains the inputs of decoder.
+
+            - encoder_inputs_dict (dict): The keyword args dictionary of
+              `self.forward_encoder()`, which includes 'feat', 'feat_mask',
+              and 'feat_pos'.
+            - decoder_inputs_dict (dict): The keyword args dictionary of
+              `self.forward_decoder()`, which includes 'memory_mask'.
+        """
+        batch_size = mlvl_feats[0].size(0)
+
+        # construct binary masks for the transformer.
+        if batch_data_samples is not None:
+            batch_input_shape = batch_data_samples[0].batch_input_shape
+            input_img_h, input_img_w = batch_input_shape
+            img_shape_list = [sample.img_shape for sample in batch_data_samples]
+            same_shape_flag = all([
+                s[0] == input_img_h and s[1] == input_img_w for s in img_shape_list
+            ])
+        else:
+            same_shape_flag = True
+        # support torch2onnx without feeding masks
+        if torch.onnx.is_in_onnx_export() or same_shape_flag:
+            mlvl_masks = []
+            mlvl_pos_embeds = []
+            for feat in mlvl_feats:
+                mlvl_masks.append(None)
+                mlvl_pos_embeds.append(
+                    self.positional_encoding(None, input=feat))
+        else:
+            masks = mlvl_feats[0].new_ones(
+                (batch_size, input_img_h, input_img_w))
+            for img_id in range(batch_size):
+                img_h, img_w = img_shape_list[img_id]
+                masks[img_id, :img_h, :img_w] = 0
+            # NOTE following the official DETR repo, non-zero
+            # values representing ignored positions, while
+            # zero values means valid positions.
+
+            mlvl_masks = []
+            mlvl_pos_embeds = []
+            for feat in mlvl_feats:
+                mlvl_masks.append(
+                    F.interpolate(masks[None], size=feat.shape[-2:]).to(
+                        torch.bool).squeeze(0))
+                mlvl_pos_embeds.append(
+                    self.positional_encoding(mlvl_masks[-1]))
+
+        feat_flatten = []
+        lvl_pos_embed_flatten = []
+        mask_flatten = []
+        spatial_shapes = []
+        for lvl, (feat, mask, pos_embed) in enumerate(
+                zip(mlvl_feats, mlvl_masks, mlvl_pos_embeds)):
+            batch_size, c, h, w = feat.shape
+            spatial_shape = torch._shape_as_tensor(feat)[2:].to(feat.device)
+            # [bs, c, h_lvl, w_lvl] -> [bs, h_lvl*w_lvl, c]
+            feat = feat.view(batch_size, c, -1).permute(0, 2, 1)
+            pos_embed = pos_embed.view(batch_size, c, -1).permute(0, 2, 1)
+            lvl_pos_embed = pos_embed + self.level_embed[lvl].view(1, 1, -1)
+            # [bs, h_lvl, w_lvl] -> [bs, h_lvl*w_lvl]
+            if mask is not None:
+                mask = mask.flatten(1)
+
+            feat_flatten.append(feat)
+            lvl_pos_embed_flatten.append(lvl_pos_embed)
+            mask_flatten.append(mask)
+            spatial_shapes.append(spatial_shape)
+
+        # (bs, num_feat_points, dim)
+        feat_flatten = torch.cat(feat_flatten, 1)
+        lvl_pos_embed_flatten = torch.cat(lvl_pos_embed_flatten, 1)
+        # (bs, num_feat_points), where num_feat_points = sum_lvl(h_lvl*w_lvl)
+        if mask_flatten[0] is not None:
+            mask_flatten = torch.cat(mask_flatten, 1)
+        else:
+            mask_flatten = None
+
+        # (num_level, 2)
+        spatial_shapes = torch.cat(spatial_shapes).view(-1, 2)
+        level_start_index = torch.cat((
+            spatial_shapes.new_zeros((1, )),  # (num_level)
+            spatial_shapes.prod(1).cumsum(0)[:-1]))
+        if mlvl_masks[0] is not None:
+            valid_ratios = torch.stack(  # (bs, num_level, 2)
+                [self.get_valid_ratio(m) for m in mlvl_masks], 1)
+        else:
+            valid_ratios = mlvl_feats[0].new_ones(batch_size, len(mlvl_feats),
+                                                  2)
+
+        encoder_inputs_dict = dict(
+            feat=feat_flatten,
+            feat_mask=mask_flatten,
+            feat_pos=lvl_pos_embed_flatten,
+            spatial_shapes=spatial_shapes,
+            level_start_index=level_start_index,
+            valid_ratios=valid_ratios)
+        decoder_inputs_dict = dict(
+            memory_mask=mask_flatten,
+            spatial_shapes=spatial_shapes,
+            level_start_index=level_start_index,
+            valid_ratios=valid_ratios)
+        return encoder_inputs_dict, decoder_inputs_dict
 
     def forward_encoder(self, feat: Tensor, feat_mask: Tensor,
                         feat_pos: Tensor, spatial_shapes: Tensor,
@@ -671,7 +691,6 @@ class GroundingDINO(DINO):
 
         losses = self.bbox_head.loss(
             **head_inputs_dict, batch_data_samples=batch_data_samples)
-        losses['aux_loss'] = self.vision_fuse.aux_loss
         return losses
 
     def predict(self, batch_inputs, batch_data_samples, rescale: bool = True):
@@ -793,46 +812,68 @@ class GroundingDINO(DINO):
         return batch_data_samples
 
     def extract_feat(self, batch_inputs: Tensor) -> Tuple[Tensor]:
-        #multi-channel image feature extraction pre-processing
-        res = []
-        for _batch_input in batch_inputs:
-            N = _batch_input.shape[0] // 2
-            res.append(_batch_input[:N, ...])
-            res.append(_batch_input[N:, ...])
-        batch_inputs = torch.stack(res, dim=0)
+        if self.fusion_module_cfg['use_fusion']:
+            #multi-channel image feature extraction pre-processing
+            res = []
+            for _batch_input in batch_inputs:
+                N = _batch_input.shape[0] // 2
+                res.append(_batch_input[:N, ...])
+                res.append(_batch_input[N:, ...])
+            batch_inputs = torch.stack(res, dim=0)
 
-        # image feature extraction
-        visual_feats = super().extract_feat(batch_inputs)
-        
-        #multi-channel image feature extraction post-processing : fusion
-        N = visual_feats[0].shape[0] // 2
-        _visual_feats = [[], []]
-        for i in range(len(visual_feats)):
-            _visual_feats[0].append(visual_feats[i][:N, ...])
-            _visual_feats[1].append(visual_feats[i][N:, ...])
-        
-        return _visual_feats[0], _visual_feats[1]
-        
-        # vif = self.pre_fusion(_visual_feats[0])
-        # iif = self.pre_fusion(_visual_feats[1]) # bs, c, concat(h*w)
+            # image feature extraction
+            visual_feats = super().extract_feat(batch_inputs)
+            
 
-        # for layer_id in range(len(self.vision_fuse_layers)):
-        #      vif, iif = self.vision_fuse_layers[layer_id](
-        #             visual_feature=vif,
-        #             lang_feature=iif,
-        #             attention_mask_v=None,
-        #             attention_mask_l=None,
-        #         )
-        # fusion_feats = ((vif + iif) / 2).permute(0,2,1)
-        # res_feats =[]
-        # start = 0
-        # for vf in visual_feats:
-        #     N,c,h,w = vf.shape
-        #     N = N // 2
-        #     res_feats.append(fusion_feats[:, :, start:start+h*w].view([N, c, h, w]))
-        #     start += h*w
-        return tuple(res_feats)
-
+            N = visual_feats[0].shape[0] // 2
+            _visual_feats = [[], []]
+            for i in range(len(visual_feats)):
+                _visual_feats[0].append(visual_feats[i][:N, ...])
+                _visual_feats[1].append(visual_feats[i][N:, ...])
+            
+            return _visual_feats[0], _visual_feats[1]
+            if self.fusion_module_cfg['type']=='moe':
+                pass
+            elif self.fusion_module_cfg['type']=='msd':
+                N = visual_feats[0].shape[0] // 2
+                _visual_feats = [[], []]
+                for i in range(len(visual_feats)):
+                    _visual_feats[0].append(visual_feats[i][:N, ...])
+                    _visual_feats[1].append(visual_feats[i][N:, ...])
+                vif_dict, _ = self.pre_transformer(_visual_feats[0], batch_data_samples=None)
+                iif_dict, _ = self.pre_transformer(_visual_feats[1], batch_data_samples=None)
+                feat_fuse = self.vision_fuser(vif=vif_dict['feat'], vif_pos=vif_dict['feat_pos'],
+                                            iif=iif_dict['feat'], iif_pos=iif_dict['feat_pos'],
+                                            key_padding_mask=vif_dict['feat_mask'],
+                                            spatial_shapes=vif_dict['spatial_shapes'],
+                                            level_start_index=vif_dict['level_start_index'],
+                                            valid_ratios=vif_dict['valid_ratios']
+                                            )
+                return feat_fuse
+            
+            elif self.fusion_module_cfg['type']=='add':        
+                N = visual_feats[0].shape[0] // 2
+                _visual_feats = []
+                for i in range(len(visual_feats)):
+                    _visual_feats.append(visual_feats[i].reshape(N, 2, *visual_feats[i].shape[1:]).sum(dim=1, keepdim=False)/2)
+                
+                return tuple(_visual_feats)
+            
+            elif self.fusion_module_cfg['type']=='concat':
+                res_feats = []
+                for vf in visual_feats:
+                    # _vf = rearrange(vf, '(b two) c h w -> b c (h two) w', two=2)
+                    _vf = vf
+                    res_feats.append(_vf)
+                return res_feats
+                return visual_feats
+            
+        
+        else:
+            # image feature extraction
+            visual_feats = super().extract_feat(batch_inputs)
+            return visual_feats
+        
     def pre_fusion(self, mlvl_feats: List[Tensor]):
         mlvl_pos_embeds = []
         for feat in mlvl_feats:
@@ -858,6 +899,6 @@ class GroundingDINO(DINO):
         return feat_flatten
     
     def feats_fuse(self, vi, ii):
-        res = self.vision_fuse(vi, ii)
+        res = self.vision_fuser(vi, ii)
         return res
         

@@ -247,7 +247,35 @@ class DeformableDetrTransformerEncoderLayer(DetrTransformerEncoderLayer):
             for _ in range(2)
         ]
         self.norms = ModuleList(norms_list)
+    
+    def forward(self, 
+                query: Tensor, 
+                query_pos: Tensor,
+                reference_points: Tensor,
+                spatial_shapes : Tensor,
+                level_start_index : Tensor,
+                key = None,
+                value = None,
+                key_padding_mask: Tensor=None,
+                **kwargs
+                ) -> Tensor:
+        if value is None:
+            value = query
+        query = self.self_attn(
+            query=query,
+            key=key,
+            value=value,
+            query_pos=query_pos,
+            key_padding_mask=key_padding_mask,
+            reference_points=reference_points,
+            spatial_shapes=spatial_shapes,
+            level_start_index=level_start_index,
+            **kwargs)
+        query = self.norms[0](query)
+        query = self.ffn(query)
+        query = self.norms[1](query)
 
+        return query
 
 class DeformableDetrTransformerDecoderLayer(DetrTransformerDecoderLayer):
     """Decoder layer of Deformable DETR."""
