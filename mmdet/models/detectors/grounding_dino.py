@@ -92,11 +92,8 @@ class GroundingDINO(DINO):
             self.embed_dims,
             bias=True)
         if self.fusion_module_cfg['use_fusion']:
-            from fairscale.nn.checkpoint import checkpoint_wrapper
             if self.fusion_module_cfg['type'] == 'moe':
-                if checkpoint_wrapper:
-                    # self.vision_fuse = checkpoint_wrapper(MOEFuse(config))
-                    self.vision_fuser = MoEFuser()
+                self.vision_fuser = MoEFuser()
             elif self.fusion_module_cfg['type'] == 'msd':
                 msd_cfg = self.fusion_module_cfg['msd_cfg']
                 self.vision_fuser = MSDeformableVisionFuser(**msd_cfg)
@@ -107,6 +104,8 @@ class GroundingDINO(DINO):
         super().init_weights()
         nn.init.constant_(self.text_feat_map.bias.data, 0)
         nn.init.xavier_uniform_(self.text_feat_map.weight.data)
+        if self.vision_fuser is not None:
+            self.vision_fuser.init_weights()
 
     def to_enhance_text_prompts(self, original_caption, enhanced_text_prompts):
         caption_string = ''
@@ -337,24 +336,33 @@ class GroundingDINO(DINO):
                                     )
             vif_dict['feat'] = feat_fuse
             encoder_inputs_dict = vif_dict
-        
+            encoder_outputs_dict = self.forward_encoder(**encoder_inputs_dict, text_dict=text_dict)
         elif self.fusion_module_cfg['type']=='add':
             
-            feat_fuse = (vi_feats + ii_feats)/2
+            feat_fuse = [(v+i)/2 for v, i in zip(vi_feats, ii_feats)]
+                        
             encoder_inputs_dict, decoder_inputs_dict = self.pre_transformer(
                 feat_fuse, batch_data_samples)
-        
+            encoder_outputs_dict = self.forward_encoder(**encoder_inputs_dict, text_dict=text_dict)
         elif self.fusion_module_cfg['type']=='moe':
             
-            feat_fuse = self.vision_fuser(vi_feats, ii_feats)
-            encoder_inputs_dict, decoder_inputs_dict = self.pre_transformer(
-                feat_fuse, batch_data_samples)
+            # feat_fuse = self.vision_fuser(vi_feats, ii_feats)
+            # encoder_inputs_dict, decoder_inputs_dict = self.pre_transformer(
+            #     feat_fuse, batch_data_samples)
+            encoder_inputs_dict, _ = self.pre_transformer(vi_feats, batch_data_samples)
+            encoder_outputs_dict = self.forward_encoder(**encoder_inputs_dict, text_dict=text_dict)
+            
+            text_dict['embedded'] = encoder_outputs_dict['memory_text']
+            
+            encoder_inputs_dict, decoder_inputs_dict = self.pre_transformer(ii_feats, batch_data_samples)
+            ii_encoder_outputs_dict = self.forward_encoder(**encoder_inputs_dict, text_dict=text_dict)
+            
+            encoder_outputs_dict['memory_text'] = ii_encoder_outputs_dict['memory_text']
+            encoder_outputs_dict['memory'] = self.feats_fuse(encoder_outputs_dict['memory'], ii_encoder_outputs_dict['memory'])
+            
         """
         feats fusion end
         """
-        
-        # encoder_inputs_dict, decoder_inputs_dict = self.pre_transformer(
-        #     img_feats, batch_data_samples)
 
         # ''' 
         #     start of the post processing of concatenate visual features
@@ -366,16 +374,6 @@ class GroundingDINO(DINO):
         # ''' 
         #     end of the post processing of concatenate visual features
         # '''
-        encoder_outputs_dict = self.forward_encoder(**encoder_inputs_dict, text_dict=text_dict)
-
-        # text_dict['embedded'] = encoder_outputs_dict['memory_text']
-
-        # encoder_inputs_dict, decoder_inputs_dict = self.pre_transformer(
-        #     ii_feats, batch_data_samples)
-        # ii_encoder_outputs_dict = self.forward_encoder(
-        #     **encoder_inputs_dict, text_dict=text_dict)
-        # encoder_outputs_dict['memory_text'] = ii_encoder_outputs_dict['memory_text']
-        # encoder_outputs_dict['memory'] = self.feats_fuse(encoder_outputs_dict['memory'], ii_encoder_outputs_dict['memory'])
         
         tmp_dec_in, head_inputs_dict = self.pre_decoder(
             **encoder_outputs_dict, batch_data_samples=batch_data_samples)
@@ -813,21 +811,21 @@ class GroundingDINO(DINO):
         if self.fusion_module_cfg['use_fusion']:
             #multi-channel image feature extraction pre-processing
             res = []
-            for _batch_input in batch_inputs:
-                N = _batch_input.shape[0] // 2
-                res.append(_batch_input[:N, ...])
-                res.append(_batch_input[N:, ...])
+            for _batch_input in batch_inputs: # [6, h, w]
+                c = _batch_input.shape[0] // 2
+                res.append(_batch_input[:c, ...])
+                res.append(_batch_input[c:, ...])
+            # vi0,ii0, vi1, ii1, ..., viN, iiN
             batch_inputs = torch.stack(res, dim=0)
 
             # image feature extraction
             visual_feats = super().extract_feat(batch_inputs)
             
 
-            N = visual_feats[0].shape[0] // 2
             _visual_feats = [[], []]
-            for i in range(len(visual_feats)):
-                _visual_feats[0].append(visual_feats[i][:N, ...])
-                _visual_feats[1].append(visual_feats[i][N:, ...])
+            for i in range(len(visual_feats)):# [2*bs,c0,h0,w0], ... ,[2*bs,c1,h1,w1]
+                _visual_feats[0].append(visual_feats[i][0::2, ...])
+                _visual_feats[1].append(visual_feats[i][1::2, ...])
             
             return _visual_feats[0], _visual_feats[1]
             if self.fusion_module_cfg['type']=='moe':

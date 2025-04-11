@@ -279,6 +279,26 @@ class MSDeformableVisionFuser(DeformableDetrTransformerEncoder):
             DeformableDetrTransformerEncoderLayer(**self.layer_cfg)
             for _ in range(self.num_layers)
         ])
+        if checkpoint_wrapper is None:
+            raise NotImplementedError(
+                    'If you want to reduce GPU memory usage, \
+                    please install fairscale by executing the \
+                    following command: pip install fairscale.')
+        else:
+            for i in range(self.num_cp):
+                self.layers[i] = checkpoint_wrapper(self.layers[i])
+    
+    def init_weights(self):
+        super().init_weights()
+        for coder in self.layers:
+            for p in coder.parameters():
+                if p.dim() > 1:
+                    nn.init.xavier_uniform_(p)
+        for m in self.modules():
+            if isinstance(m, MultiScaleDeformableAttention):
+                m.init_weights()
+                
+                
     def forward(self,
                 vif: Tensor, vif_pos: Tensor,
                 iif: Tensor, iif_pos: Tensor,
