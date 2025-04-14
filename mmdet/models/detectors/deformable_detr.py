@@ -533,7 +533,7 @@ class DeformableDETR(DetectionTransformer):
                                                   float(0))
         output_memory = self.memory_trans_fc(output_memory)
         output_memory = self.memory_trans_norm(output_memory)
-        # [bs, sum(hw), 2]
+        # [bs, sum(hw), embed_dim]
         return output_memory, output_proposals
 
     @staticmethod

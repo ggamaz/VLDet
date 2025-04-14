@@ -540,8 +540,7 @@ class GroundingDINO(DINO):
         spatial_shapes: Tensor,
         memory_text: Tensor,
         text_token_mask: Tensor,
-        batch_data_samples: OptSampleList = None,
-    ) -> Tuple[Dict]:
+        batch_data_samples: OptSampleList = None) -> Tuple[Dict]:
         bs, _, c = memory.shape
 
         output_memory, output_proposals = self.gen_encoder_output_proposals(
@@ -552,6 +551,7 @@ class GroundingDINO(DINO):
                                      text_token_mask)
         cls_out_features = self.bbox_head.cls_branches[
             self.decoder.num_layers].max_text_len
+        #bs, _, 4
         enc_outputs_coord_unact = self.bbox_head.reg_branches[
             self.decoder.num_layers](output_memory) + output_proposals
 
@@ -587,7 +587,7 @@ class GroundingDINO(DINO):
         decoder_inputs_dict = dict(
             query=query,
             memory=memory,
-            reference_points=reference_points,
+            reference_points=reference_points,# bs, num_queries, 4
             dn_mask=dn_mask,
             memory_text=memory_text,
             text_attention_mask=~text_token_mask,
@@ -603,6 +603,91 @@ class GroundingDINO(DINO):
         head_inputs_dict['memory_text'] = memory_text
         head_inputs_dict['text_token_mask'] = text_token_mask
         return decoder_inputs_dict, head_inputs_dict
+
+    def forward_decoder(self,
+                        query: Tensor,
+                        memory: Tensor,
+                        memory_mask: Tensor,
+                        reference_points: Tensor,
+                        spatial_shapes: Tensor,
+                        level_start_index: Tensor,
+                        valid_ratios: Tensor,
+                        dn_mask: Optional[Tensor] = None,
+                        **kwargs) -> Dict:
+        """Forward with Transformer decoder.
+
+        The forward procedure of the transformer is defined as:
+        'pre_transformer' -> 'encoder' -> 'pre_decoder' -> 'decoder'
+        More details can be found at `TransformerDetector.forward_transformer`
+        in `mmdet/detector/base_detr.py`.
+
+        Args:
+            query (Tensor): The queries of decoder inputs, has shape
+                (bs, num_queries_total, dim), where `num_queries_total` is the
+                sum of `num_denoising_queries` and `num_matching_queries` when
+                `self.training` is `True`, else `num_matching_queries`.
+            memory (Tensor): The output embeddings of the Transformer encoder,
+                has shape (bs, num_feat_points, dim).
+            memory_mask (Tensor): ByteTensor, the padding mask of the memory,
+                has shape (bs, num_feat_points).
+            reference_points (Tensor): The initial reference, has shape
+                (bs, num_queries_total, 4) with the last dimension arranged as
+                (cx, cy, w, h).
+            spatial_shapes (Tensor): Spatial shapes of features in all levels,
+                has shape (num_levels, 2), last dimension represents (h, w).
+            level_start_index (Tensor): The start index of each level.
+                A tensor has shape (num_levels, ) and can be represented
+                as [0, h_0*w_0, h_0*w_0+h_1*w_1, ...].
+            valid_ratios (Tensor): The ratios of the valid width and the valid
+                height relative to the width and the height of features in all
+                levels, has shape (bs, num_levels, 2).
+            dn_mask (Tensor, optional): The attention mask to prevent
+                information leakage from different denoising groups and
+                matching parts, will be used as `self_attn_mask` of the
+                `self.decoder`, has shape (num_queries_total,
+                num_queries_total).
+                It is `None` when `self.training` is `False`.
+
+        Returns:
+            dict: The dictionary of decoder outputs, which includes the
+            `hidden_states` of the decoder output and `references` including
+            the initial and intermediate reference_points.
+        """
+        if self.bbox_head.type == 'GroundingDINOHead':
+            return super().forward_decoder(
+                query=query,
+                memory=memory,
+                memory_mask=memory_mask,
+                reference_points=reference_points,
+                spatial_shapes=spatial_shapes,
+                level_start_index=level_start_index,
+                valid_ratios=valid_ratios,
+                dn_mask=dn_mask,
+                **kwargs)
+        else:
+            inter_states, references = self.decoder(
+                query=query,
+                value=memory,
+                key_padding_mask=memory_mask,
+                self_attn_mask=dn_mask,
+                reference_points=reference_points,
+                spatial_shapes=spatial_shapes,
+                level_start_index=level_start_index,
+                valid_ratios=valid_ratios,
+                reg_branches=self.bbox_head.reg_branches,
+                integral=self.bbox_head.integral,
+                **kwargs)
+
+            if len(query) == self.num_queries:
+                # NOTE: This is to make sure label_embeding can be involved to
+                # produce loss even if there is no denoising query (no ground truth
+                # target in this GPU), otherwise, this will raise runtime error in
+                # distributed training.
+                inter_states[0] += self.dn_query_generator.label_embedding.weight[0, 0] * 0.0
+
+            decoder_outputs_dict = dict(
+                hidden_states=inter_states, references=list(references))
+            return decoder_outputs_dict
 
     def loss(self, batch_inputs: Tensor,
              batch_data_samples: SampleList) -> Union[dict, list]:
@@ -687,6 +772,9 @@ class GroundingDINO(DINO):
 
         losses = self.bbox_head.loss(
             **head_inputs_dict, batch_data_samples=batch_data_samples)
+        
+        if self.fusion_module_cfg['use_fusion'] and self.fusion_module_cfg['type'] == 'moe':
+            losses['moe_loss'] = self.vision_fuser.aux_loss
         return losses
 
     def predict(self, batch_inputs, batch_data_samples, rescale: bool = True):

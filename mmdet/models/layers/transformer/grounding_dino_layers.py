@@ -14,7 +14,9 @@ from .deformable_detr_layers import (DeformableDetrTransformerDecoderLayer,
                                      DeformableDetrTransformerEncoderLayer)
 from .detr_layers import DetrTransformerEncoderLayer
 from .dino_layers import DinoTransformerDecoder
-from .utils import MLP, get_text_sine_pos_embed
+from .utils import MLP, get_text_sine_pos_embed,coordinate_to_encoding
+from mmdet.structures.bbox import distance2bbox
+from typing import Tuple
 
 try:
     from fairscale.nn.checkpoint import checkpoint_wrapper
@@ -268,9 +270,107 @@ class GroundingDinoTransformerDecoder(DinoTransformerDecoder):
         self.ref_point_head = MLP(self.embed_dims * 2, self.embed_dims,
                                   self.embed_dims, 2)
         self.norm = nn.LayerNorm(self.embed_dims)
+    
+    def forward(self, query: Tensor, value: Tensor, key_padding_mask: Tensor,
+                self_attn_mask: Tensor, reference_points: Tensor,
+                spatial_shapes: Tensor, level_start_index: Tensor,
+                valid_ratios: Tensor, reg_branches: nn.ModuleList,
+                integral:nn.Module=None,
+                **kwargs) -> Tuple[Tensor]:
+        """Forward function of Transformer decoder.
 
+        Args:
+            query (Tensor): The input query, has shape (num_queries, bs, dim).
+            value (Tensor): The input values, has shape (num_value, bs, dim).
+            key_padding_mask (Tensor): The `key_padding_mask` of `self_attn`
+                input. ByteTensor, has shape (num_queries, bs).
+            self_attn_mask (Tensor): The attention mask to prevent information
+                leakage from different denoising groups and matching parts, has
+                shape (num_queries_total, num_queries_total). It is `None` when
+                `self.training` is `False`.
+            reference_points (Tensor): The initial reference, has shape
+                (bs, num_queries, 4) with the last dimension arranged as
+                (cx, cy, w, h).
+            spatial_shapes (Tensor): Spatial shapes of features in all levels,
+                has shape (num_levels, 2), last dimension represents (h, w).
+            level_start_index (Tensor): The start index of each level.
+                A tensor has shape (num_levels, ) and can be represented
+                as [0, h_0*w_0, h_0*w_0+h_1*w_1, ...].
+            valid_ratios (Tensor): The ratios of the valid width and the valid
+                height relative to the width and the height of features in all
+                levels, has shape (bs, num_levels, 2).
+            reg_branches: (obj:`nn.ModuleList`): Used for refining the
+                regression results.
 
+        Returns:
+            tuple[Tensor]: Output queries and references of Transformer
+                decoder
 
+            - query (Tensor): Output embeddings of the last decoder, has
+              shape (num_queries, bs, embed_dims) when `return_intermediate`
+              is `False`. Otherwise, Intermediate output embeddings of all
+              decoder layers, has shape (num_decoder_layers, num_queries, bs,
+              embed_dims).
+            - reference_points (Tensor): The reference of the last decoder
+              layer, has shape (bs, num_queries, 4)  when `return_intermediate`
+              is `False`. Otherwise, Intermediate references of all decoder
+              layers, has shape (num_decoder_layers, bs, num_queries, 4). The
+              coordinates are arranged as (cx, cy, w, h)
+        """
+        intermediate = []
+        intermediate_reference_points = [reference_points]
+        pred_corners_undetach = 0
+        for lid, layer in enumerate(self.layers):
+            if reference_points.shape[-1] == 4:
+                reference_points_input = \
+                    reference_points[:, :, None] * torch.cat(
+                        [valid_ratios, valid_ratios], -1)[:, None]
+            else:
+                assert reference_points.shape[-1] == 2
+                reference_points_input = \
+                    reference_points[:, :, None] * valid_ratios[:, None]
+
+            query_sine_embed = coordinate_to_encoding(
+                reference_points_input[:, :, 0, :])
+            query_pos = self.ref_point_head(query_sine_embed)
+
+            query = layer(
+                query,
+                query_pos=query_pos,
+                value=value,
+                key_padding_mask=key_padding_mask,
+                self_attn_mask=self_attn_mask,
+                spatial_shapes=spatial_shapes,
+                level_start_index=level_start_index,
+                valid_ratios=valid_ratios,
+                reference_points=reference_points_input,
+                **kwargs)
+
+            if reg_branches is not None:
+                pred_corners = reg_branches[lid](query)
+                if integral is not None:
+                    new_reference_points = distance2bbox(reference_points[..., :2], integral(pred_corners))
+                else:
+                    assert reference_points.shape[-1] == 4
+                    new_reference_points = tmp + inverse_sigmoid(reference_points, eps=1e-3)
+                    new_reference_points = new_reference_points.sigmoid()
+
+                reference_points = new_reference_points.detach()
+            if self.return_intermediate:
+                intermediate.append(self.norm(query))
+                intermediate_reference_points.append(new_reference_points)
+                # NOTE this is for the "Look Forward Twice" module,
+                # in the DeformDETR, reference_points was appended.
+
+        if self.return_intermediate:
+            return torch.stack(intermediate), torch.stack(
+                intermediate_reference_points)
+
+        return query, reference_points
+
+"""
+    MSD Fusion实现
+"""
 class MSDeformableVisionFuser(DeformableDetrTransformerEncoder):
     """Multi-scale deformable attention cross attention fusion."""
     
@@ -356,16 +456,19 @@ class FeedForwardFusion(nn.Module):
     
     def _init_layers(self) -> None:
         import torch.nn.init as init
-        init.constant_(self.w1.weight, 0.0)
+        # init.constant_(self.w1.weight, 0.0)
+        init.eye_(self.w1.weight)
         init.eye_(self.w2.weight)
         init.eye_(self.w3.weight)
         
     def forward(self, x: Tensor):
         dim = x.shape[-1]
-        a = x[..., :dim//2]
-        b = x[..., dim//2:]
-        gate = self.gate(self.w1(b))
-        return self.w3(self.w2(a) + self.w2(b) * gate)
+        a = x[..., :dim//2] #vx
+        b = x[..., dim//2:] #ix
+        gate_b = self.gate(self.w1(b))
+        gate_a = self.gate(self.w1(a))
+
+        return self.w3(gate_a*self.w2(a) + self.w2(b) * gate_b)
     
 import math
 import torch.nn.functional as F

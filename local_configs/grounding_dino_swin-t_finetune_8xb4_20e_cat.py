@@ -6,15 +6,34 @@ dataset_type = 'PairedCocoDataset'
 
 
 model = dict(
-    bbox_head=dict(num_classes=11),
+    bbox_head=dict(
+        type='GroundingDFINEHead',
+        num_classes=11,
+        sync_cls_avg_factor=True,
+        contrastive_cfg=dict(max_text_len=256, log_scale='auto', bias=True),
+        loss_cls=dict(
+            _delete_=True,
+            type='QualityFocalLoss',
+            use_sigmoid=True,
+            beta=2.0,
+            loss_weight=1.0),
+        # loss_cls=dict(
+        #     type='FocalLoss',
+        #     use_sigmoid=True,
+        #     gamma=2.0,
+        #     alpha=0.25,
+        #     loss_weight=1.0),  # 2.0 in DeformDETR
+        reg_max=32,
+        loss_dfl=dict(type='DistributionFocalLoss', loss_weight=0.25),
+        loss_bbox=dict(type='L1Loss', loss_weight=5.0)),
     
     fusion_module = dict(
         use_fusion=True,
         
         type ="msd",
         msd_cfg=dict(
-            num_layers=1,
-            num_cp=1,
+            num_layers=4,
+            num_cp=4,
             layer_cfg=dict(
                 self_attn_cfg=dict(embed_dims=256, num_levels=4, dropout=0.0),
                 ffn_cfg=dict(
