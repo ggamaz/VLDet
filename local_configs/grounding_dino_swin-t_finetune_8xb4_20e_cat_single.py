@@ -10,7 +10,18 @@ model = dict(
       type ="moe",
       position="after_backbone",  
     ),
-    bbox_head=dict(num_classes=11)
+    bbox_head=dict(
+        type='GroundingDFINEHead',
+        num_classes=11,
+        # loss_cls=dict(
+        #     _delete_=True,
+        #     type='QualityFocalLoss',
+        #     use_sigmoid=True,
+        #     beta=2.0,
+        #     loss_weight=1.0),
+        reg_max=32,
+        loss_dfl=dict(type='DecoupledDistributionFocalLoss', loss_weight=0.25),
+        loss_ld=dict(type='KnowledgeDistillationKLDivLoss', loss_weight=0.25, T=5))
 )
 
 train_pipeline = [
@@ -94,7 +105,7 @@ val_evaluator = dict(ann_file=data_root+'coco_annotations/DV_test_ir.json',)
 # val_evaluator = dict(ann_file=data_root + 'annotations/instances_default.json')
 test_evaluator = val_evaluator
 
-max_epoch = 16
+max_epoch = 20
 
 default_hooks = dict(
     checkpoint=dict(interval=1, max_keep_ckpts=1, save_best='auto'),
@@ -120,4 +131,6 @@ optim_wrapper = dict(
             'language_model': dict(lr_mult=0.0),
         }))
 
-load_from = 'https://download.openmmlab.com/mmdetection/v3.0/mm_grounding_dino/grounding_dino_swin-t_pretrain_obj365_goldg_grit9m_v3det/grounding_dino_swin-t_pretrain_obj365_goldg_grit9m_v3det_20231204_095047-b448804b.pth'  # noqa
+# load_from = 'https://download.openmmlab.com/mmdetection/v3.0/mm_grounding_dino/grounding_dino_swin-t_pretrain_obj365_goldg_grit9m_v3det/grounding_dino_swin-t_pretrain_obj365_goldg_grit9m_v3det_20231204_095047-b448804b.pth'  # noqa
+load_from = '/root/VLDet/work_dirs/dfine_grounding_dino_swin-t_finetune_8xb4_20e_cat_single_ir/best_coco_car_precision_epoch_19.pth'  # noqa
+

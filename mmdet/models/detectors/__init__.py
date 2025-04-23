@@ -25,7 +25,7 @@ from .fsaf import FSAF
 from .gfl import GFL
 from .glip import GLIP
 from .grid_rcnn import GridRCNN
-from .grounding_dino import GroundingDINO
+from .grounding_dino import GroundingDINO, DetectorOptimizer, DistillOptimizer
 from .htc import HybridTaskCascade
 from .kd_one_stage import KnowledgeDistillationSingleStageDetector
 from .lad import LAD
@@ -71,5 +71,5 @@ __all__ = [
     'MaskFormer', 'DDOD', 'Mask2Former', 'SemiBaseDetector', 'SoftTeacher',
     'RTMDet', 'Detectron2Wrapper', 'CrowdDet', 'CondInst', 'BoxInst',
     'DetectionTransformer', 'ConditionalDETR', 'DINO', 'DABDETR', 'GLIP',
-    'DDQDETR', 'GroundingDINO'
+    'DDQDETR', 'GroundingDINO','DetectorOptimizer','DistillOptimizer'
 ]

@@ -11,14 +11,14 @@ from mmengine.structures import InstanceData
 from torch import Tensor
 
 from mmdet.models.losses import QualityFocalLoss
-from mmdet.registry import MODELS, TASK_UTILS
+from mmdet.registry import MODELS
 from mmdet.structures import SampleList
-from mmdet.structures.bbox import bbox_cxcywh_to_xyxy, bbox_xyxy_to_cxcywh
+from mmdet.structures.bbox import bbox_cxcywh_to_xyxy, bbox_xyxy_to_cxcywh, bbox_overlaps
 from mmdet.utils import InstanceList, reduce_mean
 from ..layers import inverse_sigmoid
 from .atss_vlfusion_head import convert_grounding_to_cls_scores
 from .dino_head import DINOHead
-
+from .deformable_detr_head import DeformableDETRHead
 
 class ContrastiveEmbed(nn.Module):
     """text visual ContrastiveEmbed layer.
@@ -250,11 +250,11 @@ class GroundingDINOHead(DINOHead):
         """
         all_layers_outputs_classes = []
         all_layers_outputs_coords = []
-
+        self.bbox_weights = []
         for layer_id in range(hidden_states.shape[0]):
             reference = inverse_sigmoid(references[layer_id])
             # NOTE The last reference will not be used.
-            hidden_state = hidden_states[layer_id]
+            hidden_state = hidden_states[layer_id] # (bs, 1100, 256)
             outputs_class = self.cls_branches[layer_id](hidden_state,
                                                         memory_text,
                                                         text_token_mask)
@@ -496,9 +496,99 @@ class GroundingDINOHead(DINOHead):
         self.text_masks = text_token_mask
         loss_inputs = outs + (enc_outputs_class, enc_outputs_coord,
                               batch_gt_instances, batch_img_metas, dn_meta)
+        
         losses = self.loss_by_feat(*loss_inputs)
         return losses
+   
+    def loss_by_feat(
+        self,
+        all_layers_cls_scores: Tensor,
+        all_layers_bbox_preds: Tensor,
+        enc_cls_scores: Tensor,
+        enc_bbox_preds: Tensor,
+        batch_gt_instances: InstanceList,
+        batch_img_metas: List[dict],
+        dn_meta: Dict[str, int],
+        batch_gt_instances_ignore= None) -> Dict[str, Tensor]:
+        """Loss function.
+        Args:
+            all_layers_cls_scores (Tensor): Classification scores of all
+                decoder layers, has shape (num_decoder_layers, bs,
+                num_queries_total, cls_out_channels), where
+                `num_queries_total` is the sum of `num_denoising_queries`
+                and `num_matching_queries`.
+            all_layers_bbox_preds (Tensor): Regression outputs of all decoder
+                layers. Each is a 4D-tensor with normalized coordinate format
+                (cx, cy, w, h) and has shape (num_decoder_layers, bs,
+                num_queries_total, 4).
+            enc_cls_scores (Tensor): The score of each point on encode
+                feature map, has shape (bs, num_feat_points, cls_out_channels).
+            enc_bbox_preds (Tensor): The proposal generate from the encode
+                feature map, has shape (bs, num_feat_points, 4) with the last
+                dimension arranged as (cx, cy, w, h).
+            batch_gt_instances (list[:obj:`InstanceData`]): Batch of
+                gt_instance. It usually includes ``bboxes`` and ``labels``
+                attributes.
+            batch_img_metas (list[dict]): Meta information of each image, e.g.,
+                image size, scaling factor, etc.
+            dn_meta (Dict[str, int]): The dictionary saves information about
+                group collation, including 'num_denoising_queries' and
+                'num_denoising_groups'. It will be used for split outputs of
+                denoising and matching parts and loss calculation.
+            batch_gt_instances_ignore (list[:obj:`InstanceData`], optional):
+                Batch of gt_instances_ignore. It includes ``bboxes`` attribute
+                data that is ignored during training and testing.
+                Defaults to None.
 
+        Returns:
+            dict[str, Tensor]: A dictionary of loss components.
+        """
+        # extract denoising and matching part of outputs
+        (all_layers_matching_cls_scores, all_layers_matching_bbox_preds,
+         all_layers_denoising_cls_scores, all_layers_denoising_bbox_preds) = \
+            self.split_outputs(
+                all_layers_cls_scores, all_layers_bbox_preds, dn_meta)
+
+        loss_dict = super(DeformableDETRHead, self).loss_by_feat(
+            all_layers_matching_cls_scores, all_layers_matching_bbox_preds,
+            batch_gt_instances, batch_img_metas, batch_gt_instances_ignore)
+        # NOTE DETRHead.loss_by_feat but not DeformableDETRHead.loss_by_feat
+        # is called, because the encoder loss calculations are different
+        # between DINO and DeformableDETR.
+
+        # loss of proposal generated from encode feature map.
+        if enc_cls_scores is not None:
+            # NOTE The enc_loss calculation of the DINO is
+            # different from that of Deformable DETR.
+            enc_loss_cls, enc_losses_bbox, enc_losses_iou = \
+                self.loss_by_feat_single(
+                    enc_cls_scores, enc_bbox_preds,
+                    batch_gt_instances=batch_gt_instances,
+                    batch_img_metas=batch_img_metas)
+            loss_dict['enc_loss_cls'] = enc_loss_cls
+            loss_dict['enc_loss_bbox'] = enc_losses_bbox
+            loss_dict['enc_loss_iou'] = enc_losses_iou
+
+        if all_layers_denoising_cls_scores is not None:
+            # calculate denoising loss from all decoder layers
+            dn_losses_cls, dn_losses_bbox, dn_losses_iou = self.loss_dn(
+                all_layers_denoising_cls_scores,
+                all_layers_denoising_bbox_preds,
+                batch_gt_instances=batch_gt_instances,
+                batch_img_metas=batch_img_metas,
+                dn_meta=dn_meta)
+            # collate denoising loss
+            loss_dict['dn_loss_cls'] = dn_losses_cls[-1]
+            loss_dict['dn_loss_bbox'] = dn_losses_bbox[-1]
+            loss_dict['dn_loss_iou'] = dn_losses_iou[-1]
+            for num_dec_layer, (loss_cls_i, loss_bbox_i, loss_iou_i) in \
+                    enumerate(zip(dn_losses_cls[:-1], dn_losses_bbox[:-1],
+                                  dn_losses_iou[:-1])):
+                loss_dict[f'd{num_dec_layer}.dn_loss_cls'] = loss_cls_i
+                loss_dict[f'd{num_dec_layer}.dn_loss_bbox'] = loss_bbox_i
+                loss_dict[f'd{num_dec_layer}.dn_loss_iou'] = loss_iou_i
+        return loss_dict
+    
     def loss_by_feat_single(self, cls_scores: Tensor, bbox_preds: Tensor,
                             batch_gt_instances: InstanceList,
                             batch_img_metas: List[dict]) -> Tuple[Tensor]:
@@ -596,6 +686,8 @@ class GroundingDINOHead(DINOHead):
         # regression L1 loss
         loss_bbox = self.loss_bbox(
             bbox_preds, bbox_targets, bbox_weights, avg_factor=num_total_pos)
+        
+        self.bbox_weights.append(bbox_weights)
         return loss_cls, loss_bbox, loss_iou
 
     def _loss_dn_single(self, dn_cls_scores: Tensor, dn_bbox_preds: Tensor,
@@ -773,27 +865,152 @@ class GroundingDINOHead(DINOHead):
         return (labels, label_weights, bbox_targets, bbox_weights, pos_inds,
                 neg_inds)
 
-from mmengine.model import BaseModule, ModuleList
-from mmdet.models.layers.transformer.utils import MLP
-from mmdet.utils import ConfigType,OptInstanceList
-import torch.nn.functional as F
-class Integral(nn.Module):
+def weighting_function(reg_max, up, reg_scale, deploy=False):
     """
-    A static layer that calculates integral results from a distribution.
-
-    This layer computes the target location using the formula: `sum{Pr(n) * W(n)}`,
-    where Pr(n) is the softmax probability vector representing the discrete
-    distribution, and W(n) is the non-uniform Weighting Function.
+    Generates the non-uniform Weighting Function W(n) for bounding box regression.
 
     Args:
-        reg_max (int): Max number of the discrete bins. Default is 32.
-                       It can be adjusted based on the dataset or task requirements.
-    """
+        reg_max (int): Max number of the discrete bins.
+        up (Tensor): Controls upper bounds of the sequence,
+                     where maximum offset is ±up * H / W.
+        reg_scale (float): Controls the curvature of the Weighting Function.
+                           Larger values result in flatter weights near the central axis W(reg_max/2)=0
+                           and steeper weights at both ends.
+        deploy (bool): If True, uses deployment mode settings.
 
-    def __init__(self, reg_max=32):
+    Returns:
+        Tensor: Sequence of Weighting Function.
+    """
+    if deploy:
+        upper_bound1 = (abs(up[0]) * abs(reg_scale)).item()
+        upper_bound2 = (abs(up[0]) * abs(reg_scale) * 2).item()
+        step = (upper_bound1 + 1) ** (2 / (reg_max - 2))
+        left_values = [-((step) ** i) + 1 for i in range(reg_max // 2 - 1, 0, -1)]
+        right_values = [(step) ** i - 1 for i in range(1, reg_max // 2)]
+        values = (
+            [-upper_bound2]
+            + left_values
+            + [torch.zeros_like(up[0][None])]
+            + right_values
+            + [upper_bound2]
+        )
+        return torch.tensor(values, dtype=up.dtype, device=up.device)
+    else:
+        upper_bound1 = abs(up[0]) * abs(reg_scale)
+        upper_bound2 = abs(up[0]) * abs(reg_scale) * 2
+        step = (upper_bound1 + 1) ** (2 / (reg_max - 2))
+        left_values = [-((step) ** i) + 1 for i in range(reg_max // 2 - 1, 0, -1)]
+        right_values = [(step) ** i - 1 for i in range(1, reg_max // 2)]
+        values = (
+            [-upper_bound2]
+            + left_values
+            + [torch.zeros_like(up[0][None])]
+            + right_values
+            + [upper_bound2]
+        )
+        return torch.cat(values, 0)
+def translate_gt(gt, reg_max, reg_scale, up):
+    """
+    Decodes bounding box ground truth (GT) values into distribution-based GT representations.
+
+    This function maps continuous GT values into discrete distribution bins, which can be used
+    for regression tasks in object detection models. It calculates the indices of the closest
+    bins to each GT value and assigns interpolation weights to these bins based on their proximity
+    to the GT value.
+
+    Args:
+        gt (Tensor): Ground truth bounding box values, shape (N, ).
+        reg_max (int): Maximum number of discrete bins for the distribution.
+        reg_scale (float): Controls the curvature of the Weighting Function.
+        up (Tensor): Controls the upper bounds of the Weighting Function.
+
+    Returns:
+        Tuple[Tensor, Tensor, Tensor]:
+            - indices (Tensor): Index of the left bin closest to each GT value, shape (N, ).
+            - weight_right (Tensor): Weight assigned to the right bin, shape (N, ).
+            - weight_left (Tensor): Weight assigned to the left bin, shape (N, ).
+    """
+    gt = gt.reshape(-1)
+    function_values = weighting_function(reg_max, up, reg_scale)
+
+    # Find the closest left-side indices for each value
+    diffs = function_values.unsqueeze(0) - gt.unsqueeze(1)
+    mask = diffs <= 0
+    closest_left_indices = torch.sum(mask, dim=1) - 1
+
+    # Calculate the weights for the interpolation
+    indices = closest_left_indices.float()
+
+    weight_right = torch.zeros_like(indices)
+    weight_left = torch.zeros_like(indices)
+
+    valid_idx_mask = (indices >= 0) & (indices < reg_max)
+    valid_indices = indices[valid_idx_mask].long()
+
+    # Obtain distances
+    left_values = function_values[valid_indices]
+    right_values = function_values[valid_indices + 1]
+
+    left_diffs = torch.abs(gt[valid_idx_mask] - left_values)
+    right_diffs = torch.abs(right_values - gt[valid_idx_mask])
+
+    # Valid weights
+    weight_right[valid_idx_mask] = left_diffs / (left_diffs + right_diffs)
+    weight_left[valid_idx_mask] = 1.0 - weight_right[valid_idx_mask]
+
+    # Invalid weights (out of range)
+    invalid_idx_mask_neg = indices < 0
+    weight_right[invalid_idx_mask_neg] = 0.0
+    weight_left[invalid_idx_mask_neg] = 1.0
+    indices[invalid_idx_mask_neg] = 0.0
+
+    invalid_idx_mask_pos = indices >= reg_max
+    weight_right[invalid_idx_mask_pos] = 1.0
+    weight_left[invalid_idx_mask_pos] = 0.0
+    indices[invalid_idx_mask_pos] = reg_max - 0.1
+
+    return indices, weight_right, weight_left
+from mmdet.models.layers.transformer.grounding_dino_layers import distance2bbox
+def bbox2distance(points, bbox, reg_max, reg_scale, up, eps=0.1):
+    """
+    Converts bounding box coordinates to distances from a reference point.
+
+    Args:
+        points (Tensor): (n, 4) [x, y, w, h], where (x, y) is the center.
+        bbox (Tensor): (n, 4) bounding boxes in "xyxy" format.
+        reg_max (float): Maximum bin value.
+        reg_scale (float): Controling curvarture of W(n).
+        up (Tensor): Controling upper bounds of W(n).
+        eps (float): Small value to ensure target < reg_max.
+
+    Returns:
+        Tensor: Decoded distances.
+    """
+    reg_scale = abs(reg_scale)
+    left = (points[:, 0] - bbox[:, 0]) / (points[..., 2] / reg_scale + 1e-16) - 0.5 * reg_scale
+    top = (points[:, 1] - bbox[:, 1]) / (points[..., 3] / reg_scale + 1e-16) - 0.5 * reg_scale
+    right = (bbox[:, 2] - points[:, 0]) / (points[..., 2] / reg_scale + 1e-16) - 0.5 * reg_scale
+    bottom = (bbox[:, 3] - points[:, 1]) / (points[..., 3] / reg_scale + 1e-16) - 0.5 * reg_scale
+    four_lens = torch.stack([left, top, right, bottom], -1)
+    four_lens, weight_right, weight_left = translate_gt(four_lens, reg_max, reg_scale, up)
+    if reg_max is not None:
+        four_lens = four_lens.clamp(min=0, max=reg_max - eps)
+    return four_lens.reshape(-1).detach(), weight_right.detach(), weight_left.detach()
+
+# from mmengine.model import BaseModule, ModuleList
+# from mmdet.models.layers.transformer.utils import MLP
+from mmdet.utils import ConfigType,OptInstanceList
+import torch.nn.functional as F
+from ..utils import multi_apply
+
+
+class Integral(nn.Module):
+    def __init__(self, reg_max=32, up=torch.tensor([0.5]), reg_scale=torch.tensor([4.0])):
         super(Integral, self).__init__()
         self.reg_max = reg_max
-        self.register_buffer('project', torch.linspace(0, self.reg_max, self.reg_max + 1))
+        self.reg_scale = reg_scale
+        self.up = up
+        self.register_buffer('project', weighting_function(self.reg_max, up, reg_scale))
     def forward(self, x):
         shape = x.shape
         x = F.softmax(x.reshape(-1, self.reg_max + 1), dim=1)
@@ -804,9 +1021,8 @@ class Integral(nn.Module):
 class GroundingDFINEHead(GroundingDINOHead):
     def __init__(self,
                  reg_max:int=32,
-                 bbox_coder: ConfigType = dict(type='DistancePointBBoxCoder'),
-                 loss_dfl: ConfigType = dict(type='DistributionFocalLoss', loss_weight=0.25),
-                 loss_ld: ConfigType = dict(type='LocalizationDistillationLoss',loss_weight=0.25,T=10),
+                 loss_dfl: ConfigType = dict(type='DecoupledDistributionFocalLoss', loss_weight=0.25),
+                 loss_ld: ConfigType = dict(type='KnowledgeDistillationKLDivLoss', loss_weight=0.25, T=5),
                  **kwargs):
         self.reg_max = reg_max
         super().__init__(**kwargs)
@@ -814,59 +1030,69 @@ class GroundingDFINEHead(GroundingDINOHead):
         self.up = nn.Parameter(torch.tensor([0.5]), requires_grad=False)
         self.reg_scale = nn.Parameter(torch.tensor([4.0]), requires_grad=False)
         # self.project = weighting_function(self.reg_max, self.up, self.reg_scale)
-        self.integral = Integral(self.reg_max)
-        
-        #regression branch
-        self.reg_branches = nn.ModuleList([
-            MLP(self.embed_dims, self.embed_dims, 4 * (self.reg_max + 1), 3)
-            for _ in range(self.num_pred_layer-1)])
-        self.reg_branches.append(MLP(self.embed_dims, self.embed_dims, 4, 3))
+        self.integral = Integral(self.reg_max, self.up, self.reg_scale)
         
         #location quality estimation
         # self.lqe_branches = nn.ModuleList(
         #     [LQE(4, 64, 2, self.reg_max) for _ in range(self.num_pred_layer)]
         # )
-        if self.train_cfg:
-            self.bbox_coder = TASK_UTILS.build(bbox_coder)
         self.loss_dfl = MODELS.build(loss_dfl)
         self.loss_ld = MODELS.build(loss_ld)
     
-    def forward(
-        self,
-        hidden_states: Tensor,
-        references: List[Tensor],
-        memory_text: Tensor,
-        text_token_mask: Tensor) -> Tuple[Tensor]:
+    def _init_layers(self) -> None:
+        """Initialize classification branch and regression branch of head."""
+        fc_cls = ContrastiveEmbed(**self.contrastive_cfg)
+        def mlp(in_dims, hidden_dims, out_dims, layers):
+            mlp = []
+            for i in range(layers-1):
+                mlp.append(Linear(in_dims, hidden_dims))
+                mlp.append(nn.ReLU())
+                in_dims = hidden_dims
+            mlp.append(Linear(hidden_dims, out_dims))
+            return nn.Sequential(*mlp)
+        reg_branch = mlp(self.embed_dims, self.embed_dims, 4 * (self.reg_max + 1), self.num_reg_fcs+1)
+        bbox_branch = mlp(self.embed_dims, self.embed_dims, 4, self.num_reg_fcs+1)
+        
+        # NOTE: due to the fc_cls is a contrastive embedding and don't
+        # have any trainable parameters,we do not need to copy it.
+        if self.share_pred_layer:
+            self.cls_branches = nn.ModuleList(
+                [fc_cls for _ in range(self.num_pred_layer)])
+            self.reg_branches = nn.ModuleList(
+                [reg_branch for _ in range(self.num_pred_layer-1)])
+            self.reg_branches.append(bbox_branch)
+        else:
+            self.cls_branches = nn.ModuleList(
+                [copy.deepcopy(fc_cls) for _ in range(self.num_pred_layer)])
+            self.reg_branches = nn.ModuleList([
+                copy.deepcopy(reg_branch) for _ in range(self.num_pred_layer)])
+            self.reg_branches[-1] = bbox_branch
+
+    def forward(self, hidden_states: Tensor,
+                    references: List[Tensor],
+                    memory_text: Tensor,
+                    text_token_mask: Tensor) -> Tuple[Tensor]:
         all_layers_outputs_classes = []
         all_layers_outputs_corners = []
         all_layers_outputs_coords = []
         self.ref_points = torch.stack(references,dim=0)
+        
+        reference = references[-1].detach()
         for layer_id in range(hidden_states.shape[0]):
-            reference = inverse_sigmoid(references[layer_id])
+            # reference = references[layer_id]
             # NOTE The last reference will not be used.
             hidden_state = hidden_states[layer_id]
             outputs_class = self.cls_branches[layer_id](hidden_state,
                                                         memory_text,
                                                         text_token_mask)
             tmp_reg_corners = self.reg_branches[layer_id](hidden_state) #(bs, num_queries, 4 * (self.reg_max + 1))
-            tmp_reg_preds = self.bbox_coder.decode(reference[...,:2], self.integral(tmp_reg_corners)) #(bs, num_queries, 4)
+            outputs_coord = distance2bbox(reference, self.integral(tmp_reg_corners), self.integral.reg_scale)
             
-            if reference.shape[-1] == 4:
-                # When `layer` is 0 and `as_two_stage` of the detector
-                # is `True`, or when `layer` is greater than 0 and
-                # `with_box_refine` of the detector is `True`.
-                tmp_reg_preds += reference
-            else:
-                # When `layer` is 0 and `as_two_stage` of the detector
-                # is `False`, or when `layer` is greater than 0 and
-                # `with_box_refine` of the detector is `False`.
-                assert reference.shape[-1] == 2
-                tmp_reg_preds[..., :2] += reference
-            outputs_coord = tmp_reg_preds.sigmoid()
+            reference = outputs_coord.detach()
             all_layers_outputs_classes.append(outputs_class)
             all_layers_outputs_coords.append(outputs_coord)
             all_layers_outputs_corners.append(tmp_reg_corners)
-
+            
         all_layers_outputs_classes = torch.stack(all_layers_outputs_classes)
         all_layers_outputs_coords = torch.stack(all_layers_outputs_coords)
         all_layers_outputs_corners = torch.stack(all_layers_outputs_corners)
@@ -928,7 +1154,6 @@ class GroundingDFINEHead(GroundingDINOHead):
         all_layers_matching_corner_preds,all_layers_denoising_corner_preds = self.split_outputs(all_layers_corner_preds, dn_meta)
         all_layers_matching_ref_points,all_layers_denoising_ref_points = self.split_outputs(self.ref_points, dn_meta)
         all_layers_matching_soft_corner_preds,all_layers_denoising_soft_corner_preds = self.split_outputs(all_layers_soft_corner_preds, dn_meta)
-        
 
         assert batch_gt_instances_ignore is None, f'{self.__class__.__name__} only supports for batch_gt_instances_ignore setting to None.'
         losses_cls, losses_bbox, losses_iou = multi_apply(
@@ -948,23 +1173,20 @@ class GroundingDFINEHead(GroundingDINOHead):
             batch_img_metas=batch_img_metas)
         
         loss_dict = dict()
-        # loss from the last decoder layer
-        loss_dict['loss_cls'] = losses_cls[-1]
-        loss_dict['loss_bbox'] = losses_bbox[-1]
-        loss_dict['loss_iou'] = losses_iou[-1]
-        loss_dict['loss_dfl'] = losses_dfl[-1]
-        loss_dict['loss_ld'] = losses_ld[-1]
-        # loss from other decoder layers
-        num_dec_layer = 0
-        for loss_cls_i, loss_bbox_i, loss_iou_i, loss_dfl_i in \
-                zip(losses_cls[:-1], losses_bbox[:-1], losses_iou[:-1], losses_dfl[:-1]):
-            loss_dict[f'd{num_dec_layer}.loss_cls'] = loss_cls_i
-            loss_dict[f'd{num_dec_layer}.loss_bbox'] = loss_bbox_i
-            loss_dict[f'd{num_dec_layer}.loss_iou'] = loss_iou_i
-            loss_dict[f'd{num_dec_layer}.loss_dfl'] = loss_dfl_i
-            num_dec_layer += 1
+        def add_decoder_layer_loss(loss_dict, losses, t):
+            num_dec_layer = 0
+            # loss from the last decoder layer
+            loss_dict[t]=losses[-1]
+            for loss in losses[:-1]:
+                loss_dict[f'd{num_dec_layer}.{t}'] = loss
+                num_dec_layer += 1
+            return loss_dict
+        loss_dict = add_decoder_layer_loss(loss_dict, losses_cls, 'loss_cls')
+        loss_dict = add_decoder_layer_loss(loss_dict, losses_bbox, 'loss_bbox')
+        loss_dict = add_decoder_layer_loss(loss_dict, losses_iou, 'loss_iou')
+        loss_dict = add_decoder_layer_loss(loss_dict, losses_dfl, 'loss_dfl')
+        loss_dict = add_decoder_layer_loss(loss_dict, losses_ld, 'loss_ld')
 
-        
         if enc_cls_scores is not None:
             # NOTE The enc_loss calculation of the DINO is
             # different from that of Deformable DETR.
@@ -988,20 +1210,13 @@ class GroundingDFINEHead(GroundingDINOHead):
                 batch_img_metas=batch_img_metas,
                 dn_meta=dn_meta)
             # collate denoising loss
-            loss_dict['dn_loss_cls'] = dn_losses_cls[-1]
-            loss_dict['dn_loss_bbox'] = dn_losses_bbox[-1]
-            loss_dict['dn_loss_iou'] = dn_losses_iou[-1]
-            loss_dict['dn_loss_dfl'] = dn_losses_dfl[-1]
-            for num_dec_layer, (loss_cls_i, loss_bbox_i, loss_iou_i,loss_dfl_i) in \
-                    enumerate(zip(dn_losses_cls[:-1], dn_losses_bbox[:-1],
-                                  dn_losses_iou[:-1]),dn_losses_dfl[:-1]):
-                loss_dict[f'd{num_dec_layer}.dn_loss_cls'] = loss_cls_i
-                loss_dict[f'd{num_dec_layer}.dn_loss_bbox'] = loss_bbox_i
-                loss_dict[f'd{num_dec_layer}.dn_loss_iou'] = loss_iou_i
-                loss_dict[f'd{num_dec_layer}.dn_loss_dfl'] = loss_dfl_i
-        
-        
+            loss_dict = add_decoder_layer_loss(loss_dict, dn_losses_cls, 'dn_loss_cls')
+            loss_dict = add_decoder_layer_loss(loss_dict, dn_losses_bbox, 'dn_loss_bbox')
+            loss_dict = add_decoder_layer_loss(loss_dict, dn_losses_iou, 'dn_loss_iou')
+            loss_dict = add_decoder_layer_loss(loss_dict, dn_losses_dfl, 'dn_loss_dfl')
+            # loss_dict = add_decoder_layer_loss(loss_dict, losses_ld, 'loss_ld')
         return loss_dict
+    
     def specific_loss_by_feat_single(self, 
                                     cls_scores: Tensor, bbox_preds: Tensor,
                                     corner_preds: Tensor, ref_points: Tensor,
@@ -1030,26 +1245,38 @@ class GroundingDFINEHead(GroundingDINOHead):
                                                bbox_pred.size(0), 1)
             factors.append(factor)
         factors = torch.cat(factors, 0)
-        bboxes_gt = bbox_cxcywh_to_xyxy(bbox_targets) * factors
-        
-        pred_corners = corner_preds.reshape(-1, self.reg_max + 1) * factors
-        target_corners = self.bbox_coder.encode(ref_points[..., :2], bboxes_gt, self.reg_max).reshape(-1)
-        
+        bboxes_gt = bbox_cxcywh_to_xyxy(bbox_targets)
+        pred_corners = corner_preds.reshape(-1, self.reg_max + 1)
+        target_corners, weight_left, weight_right = bbox2distance(ref_points.reshape(-1,4), 
+                                                                  bboxes_gt, 
+                                                                  self.reg_max, self.reg_scale, self.up)
+                
+        # Compute the average number of gt boxes across all gpus, for
+        # normalization purposes
+        num_total = num_total_pos + num_total_neg
+        num_total = max(num_total, 1)
         # dfl loss
         loss_dfl = self.loss_dfl(
                 pred_corners,
                 target_corners,
-                weight=None,
-                avg_factor=4.0)
+                weight_left, weight_right,
+                weight=bbox_weights.reshape(-1),
+                avg_factor=num_total)
         
-        
-        # ld loss
-        soft_corners = soft_corners.reshape(-1, self.reg_max + 1) * factors
-        loss_ld = self.loss_ld(
+        soft_corners = soft_corners.reshape(-1, self.reg_max + 1)
+        loss_ld_pos = self.loss_ld(
                 pred_corners,#(N*4, (self.reg_max + 1))
                 soft_corners,
-                weight=None,
-                avg_factor=4.0)
+                weight=bbox_weights.reshape(-1),
+                avg_factor=None,
+                reduction_override='sum')
+        loss_ld_neg = self.loss_ld(
+                pred_corners,#(N*4, (self.reg_max + 1))
+                soft_corners,
+                weight=(1-bbox_weights).reshape(-1),
+                avg_factor=None,
+                reduction_override='sum')
+        loss_ld = (loss_ld_neg * num_total_neg + loss_ld_pos * num_total_pos)/(num_total)
         return loss_dfl, loss_ld
         
 
@@ -1093,8 +1320,8 @@ class GroundingDFINEHead(GroundingDINOHead):
             batch_gt_instances=batch_gt_instances,
             batch_img_metas=batch_img_metas,
             dn_meta=dn_meta)
-
-    def _loss_dn_single(self, dn_cls_scores: Tensor, dn_bbox_preds: Tensor,dn_corner_preds,dn_ref_points: Tensor,
+    def _loss_dn_single(self, dn_cls_scores: Tensor, dn_bbox_preds: Tensor,
+                        dn_corner_preds: Tensor, dn_ref_points: Tensor,
                         batch_gt_instances: InstanceList,
                         batch_img_metas: List[dict],
                         dn_meta: Dict[str, int]) -> Tuple[Tensor]:
@@ -1126,13 +1353,26 @@ class GroundingDFINEHead(GroundingDINOHead):
                                               batch_img_metas, dn_meta)
         (labels_list, label_weights_list, bbox_targets_list, bbox_weights_list,
          num_total_pos, num_total_neg) = cls_reg_targets
-        labels = torch.cat(labels_list, 0)
-        label_weights = torch.cat(label_weights_list, 0)
+        labels = torch.stack(labels_list, 0)
+        label_weights = torch.stack(label_weights_list, 0)
         bbox_targets = torch.cat(bbox_targets_list, 0)
         bbox_weights = torch.cat(bbox_weights_list, 0)
+        # ===== this change =====
+        # Loss is not computed for the padded regions of the text.
+        assert (self.text_masks.dim() == 2)
+        text_masks = self.text_masks.new_zeros(
+            (self.text_masks.size(0), self.max_text_len))
+        text_masks[:, :self.text_masks.size(1)] = self.text_masks
+        text_mask = (text_masks > 0).unsqueeze(1)
+        text_mask = text_mask.repeat(1, dn_cls_scores.size(1), 1)
+        cls_scores = torch.masked_select(dn_cls_scores, text_mask).contiguous()
+        labels = torch.masked_select(labels, text_mask)
+        label_weights = label_weights[...,
+                                      None].repeat(1, 1, text_mask.size(-1))
+        label_weights = torch.masked_select(label_weights, text_mask)
+        # =======================
 
         # classification loss
-        cls_scores = dn_cls_scores.reshape(-1, self.cls_out_channels)
         # construct weighted avg_factor to match with the official DETR repo
         cls_avg_factor = \
             num_total_pos * 1.0 + num_total_neg * self.bg_cls_weight
@@ -1143,22 +1383,7 @@ class GroundingDFINEHead(GroundingDINOHead):
 
         if len(cls_scores) > 0:
             if isinstance(self.loss_cls, QualityFocalLoss):
-                bg_class_ind = self.num_classes
-                pos_inds = ((labels >= 0)
-                            & (labels < bg_class_ind)).nonzero().squeeze(1)
-                scores = label_weights.new_zeros(labels.shape)
-                pos_bbox_targets = bbox_targets[pos_inds]
-                pos_decode_bbox_targets = bbox_cxcywh_to_xyxy(pos_bbox_targets)
-                pos_bbox_pred = dn_bbox_preds.reshape(-1, 4)[pos_inds]
-                pos_decode_bbox_pred = bbox_cxcywh_to_xyxy(pos_bbox_pred)
-                scores[pos_inds] = bbox_overlaps(
-                    pos_decode_bbox_pred.detach(),
-                    pos_decode_bbox_targets,
-                    is_aligned=True)
-                loss_cls = self.loss_cls(
-                    cls_scores, (labels, scores),
-                    weight=label_weights,
-                    avg_factor=cls_avg_factor)
+                raise NotImplementedError('QualityFocalLoss is not supported')
             else:
                 loss_cls = self.loss_cls(
                     cls_scores,
@@ -1199,19 +1424,23 @@ class GroundingDFINEHead(GroundingDINOHead):
         loss_bbox = self.loss_bbox(
             bbox_preds, bbox_targets, bbox_weights, avg_factor=num_total_pos)
         
+        pred_corners = dn_corner_preds.reshape(-1, self.reg_max + 1)
         
-        pred_corners = dn_corner_preds.reshape(-1, self.reg_max + 1) * factors
-        print(ref_points.shape)
-        target_corners = self.bbox_coder.encode(dn_ref_points, bboxes_gt, self.reg_max).reshape(-1)
-        
+        target_corners, weight_left, weight_right = bbox2distance(dn_ref_points.reshape(-1, 4), 
+                                                                  bboxes_gt/factors, 
+                                                                  self.reg_max, self.reg_scale, self.up)
         # dfl loss
+        num_total = num_total_pos + num_total_neg
+        num_total = max(num_total, 1)
         loss_dfl = self.loss_dfl(
                 pred_corners,
                 target_corners,
-                weight=weight_targets[:, None].expand(-1, 4).reshape(-1),
-                avg_factor=4.0)
+                weight_left, weight_right,
+                weight=bbox_weights.reshape(-1),
+                avg_factor=num_total)
+        
         return loss_cls, loss_bbox, loss_iou, loss_dfl
-
+   
     @staticmethod
     def split_outputs(preds: Tensor,#(num_decoder_layers, bs, num_queries_total, n).
                       dn_meta: Dict[str, int]) -> Tuple[Tensor]:
@@ -1223,3 +1452,52 @@ class GroundingDFINEHead(GroundingDINOHead):
             denoising_preds = None
             matching_preds = preds
         return (matching_preds,denoising_preds)
+    
+    
+
+
+@MODELS.register_module()
+class HeadOptimizer(nn.Module):
+    def __init__(self):
+        super().__init__()
+    
+    def forward(self, head, hidden_states: Tensor, references: List[Tensor],
+                memory_text: Tensor, text_token_mask: Tensor,
+                enc_outputs_class: Tensor, enc_outputs_coord: Tensor,
+                batch_data_samples: SampleList, dn_meta: Dict[str, int]):
+        
+        # all_layers_outputs_classes, all_layers_outputs_coords, all_layers_outputs_corners = \
+        #                                 head(hidden_states, references, memory_text, text_token_mask)
+        batch_gt_instances = []
+        batch_img_metas = []
+        for data_sample in batch_data_samples:
+            batch_img_metas.append(data_sample.metainfo)
+            batch_gt_instances.append(data_sample.gt_instances)
+
+        outs = head(hidden_states, references, memory_text, text_token_mask)
+        all_layers_outputs_classes, all_layers_outputs_coords = outs
+        head.text_masks = text_token_mask
+        loss_inputs = outs + (enc_outputs_class, enc_outputs_coord,
+                              batch_gt_instances, batch_img_metas, dn_meta)
+        losses = head.loss_by_feat(*loss_inputs)
+        """compute reward"""
+        # giou最近1,最远-1
+        loss_giou = [losses[f'd{i}.loss_iou'] for i in range(len(hidden_states)-1)]
+        loss_giou.append(losses["loss_iou"])
+        iou_reward = list(map(lambda x: (-x/head.loss_iou.loss_weight + 2), loss_giou)) 
+        iou_reward = torch.stack(iou_reward, dim=-1)*head.loss_iou.loss_weight
+        #
+        loss_l1 = [losses[f'd{i}.loss_bbox'] for i in range(len(hidden_states)-1)]
+        loss_l1.append(losses["loss_bbox"])
+        loss_l1 = torch.stack(loss_l1, dim=-1)
+        rewards = iou_reward-loss_l1
+        advantages: Tensor = (rewards - rewards.mean(dim=-1)) / (rewards.std(-1) + 1e-6) # [num_layers, 1]
+        
+        """compute loss"""
+        all_layers_matching_coords, _ = GroundingDFINEHead.split_outputs(all_layers_outputs_coords, dn_meta)
+        bbox_weights = torch.stack(head.bbox_weights[:-1], 
+                                   dim=0).reshape(*all_layers_matching_coords.shape[:-1], head.bbox_weights[0].shape[-1])
+        loss = -torch.where(bbox_weights==1, all_layers_matching_coords, torch.zeros_like(all_layers_matching_coords)) #(num_layers, bs, num_queries, 4)
+        loss = loss*advantages.reshape(-1, 1, 1, 1)
+        return loss[bbox_weights==1].mean(-1)
+        

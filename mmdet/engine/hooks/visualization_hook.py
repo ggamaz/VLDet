@@ -368,7 +368,6 @@ class GroundingVisualizationHook(DetVisualizationHook):
 
             self._test_index += 1
 
-            # import ipdb; ipdb.set_trace()
             img_path = data_sample.img_path
             if isinstance(img_path, list):
                 img_path = img_path[0]

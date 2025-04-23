@@ -40,3 +40,12 @@ class CheckInvalidLossHook(Hook):
         if self.every_n_train_iters(runner, self.interval):
             assert torch.isfinite(outputs['loss']), \
                 runner.logger.info('loss become infinite or NaN!')
+
+
+@HOOKS.register_module()
+class LoadReferenceModelHook(Hook):
+
+    def before_train(self, runner):
+        import ipdb
+        ipdb.set_trace()
+        runner.model.load_refmodel()

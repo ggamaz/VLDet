@@ -91,13 +91,15 @@ class GroundingDINO(DINO):
             self.language_model.language_backbone.body.language_dim,
             self.embed_dims,
             bias=True)
+        
+        #fuser
+        self.vision_fuser = None    
         if self.fusion_module_cfg['use_fusion']:
             if self.fusion_module_cfg['type'] == 'moe':
                 self.vision_fuser = MoEFuser()
             elif self.fusion_module_cfg['type'] == 'msd':
                 msd_cfg = self.fusion_module_cfg['msd_cfg']
                 self.vision_fuser = MSDeformableVisionFuser(**msd_cfg)
-
             
     def init_weights(self) -> None:
         """Initialize weights for Transformer and other components."""
@@ -319,62 +321,65 @@ class GroundingDINO(DINO):
         text_dict: Dict,
         batch_data_samples: OptSampleList = None,
     ) -> Dict:
-        vi_feats, ii_feats = img_feats
-        
-        """
-        feats fusion begin
-        """
-        if self.fusion_module_cfg['type']=='msd':
-            vif_dict, decoder_inputs_dict = self.pre_transformer(vi_feats, batch_data_samples=None)
-            iif_dict, _ = self.pre_transformer(ii_feats, batch_data_samples=None)
-            feat_fuse = self.vision_fuser(vif=vif_dict['feat'], vif_pos=vif_dict['feat_pos'],
-                                        iif=iif_dict['feat'], iif_pos=iif_dict['feat_pos'],
-                                        key_padding_mask=vif_dict['feat_mask'],
-                                        spatial_shapes=vif_dict['spatial_shapes'],
-                                        level_start_index=vif_dict['level_start_index'],
-                                        valid_ratios=vif_dict['valid_ratios']
-                                    )
-            vif_dict['feat'] = feat_fuse
-            encoder_inputs_dict = vif_dict
+        if self.fusion_module_cfg['use_fusion']:
+            vi_feats, ii_feats = img_feats
+            """
+            feats fusion begin
+            """
+            if self.fusion_module_cfg['type']=='msd':
+                vif_dict, decoder_inputs_dict = self.pre_transformer(vi_feats, batch_data_samples=None)
+                iif_dict, _ = self.pre_transformer(ii_feats, batch_data_samples=None)
+                feat_fuse = self.vision_fuser(vif=vif_dict['feat'], vif_pos=vif_dict['feat_pos'],
+                                            iif=iif_dict['feat'], iif_pos=iif_dict['feat_pos'],
+                                            key_padding_mask=vif_dict['feat_mask'],
+                                            spatial_shapes=vif_dict['spatial_shapes'],
+                                            level_start_index=vif_dict['level_start_index'],
+                                            valid_ratios=vif_dict['valid_ratios']
+                                        )
+                vif_dict['feat'] = feat_fuse
+                encoder_inputs_dict = vif_dict
+                encoder_outputs_dict = self.forward_encoder(**encoder_inputs_dict, text_dict=text_dict)
+                
+            elif self.fusion_module_cfg['type']=='add':
+                feat_fuse = [(v+i)/2 for v, i in zip(vi_feats, ii_feats)]
+                encoder_inputs_dict, decoder_inputs_dict = self.pre_transformer(feat_fuse, batch_data_samples)
+                encoder_outputs_dict = self.forward_encoder(**encoder_inputs_dict, text_dict=text_dict)
+                            
+            elif self.fusion_module_cfg['type']=='moe':
+                # feat_fuse = self.vision_fuser(vi_feats, ii_feats)
+                # encoder_inputs_dict, decoder_inputs_dict = self.pre_transformer(
+                #     feat_fuse, batch_data_samples)
+                encoder_inputs_dict, _ = self.pre_transformer(vi_feats, batch_data_samples)
+                encoder_outputs_dict = self.forward_encoder(**encoder_inputs_dict, text_dict=text_dict)
+                
+                text_dict['embedded'] = encoder_outputs_dict['memory_text']
+                
+                encoder_inputs_dict, decoder_inputs_dict = self.pre_transformer(ii_feats, batch_data_samples)
+                ii_encoder_outputs_dict = self.forward_encoder(**encoder_inputs_dict, text_dict=text_dict)
+                
+                encoder_outputs_dict['memory_text'] = ii_encoder_outputs_dict['memory_text']
+                encoder_outputs_dict['memory'] = self.vision_fuser(encoder_outputs_dict['memory'], ii_encoder_outputs_dict['memory'])
+                
+                   
+            # elif self.fusion_module_cfg['type']=='concat':
+                
+            """
+            feats fusion end
+            """
+            # ''' 
+            #     start of the post processing of concatenate visual features
+            # '''
+            # bs = len(batch_data_samples)
+            # encoder_inputs_dict['feat'] = rearrange(encoder_inputs_dict['feat'], '(b two) n c -> b (n two) c', two=2)
+            # encoder_inputs_dict['feat_pos'] = rearrange(encoder_inputs_dict['feat_pos'], '(b two) n c -> b (n two) c', two=2)
+            # encoder_inputs_dict['valid_ratios'] = encoder_inputs_dict['valid_ratios'][:bs]
+            # ''' 
+            #     end of the post processing of concatenate visual features
+            # '''
+        else:
+            encoder_inputs_dict, decoder_inputs_dict = self.pre_transformer(img_feats, batch_data_samples=None)
             encoder_outputs_dict = self.forward_encoder(**encoder_inputs_dict, text_dict=text_dict)
-        elif self.fusion_module_cfg['type']=='add':
             
-            feat_fuse = [(v+i)/2 for v, i in zip(vi_feats, ii_feats)]
-                        
-            encoder_inputs_dict, decoder_inputs_dict = self.pre_transformer(
-                feat_fuse, batch_data_samples)
-            encoder_outputs_dict = self.forward_encoder(**encoder_inputs_dict, text_dict=text_dict)
-        elif self.fusion_module_cfg['type']=='moe':
-            
-            # feat_fuse = self.vision_fuser(vi_feats, ii_feats)
-            # encoder_inputs_dict, decoder_inputs_dict = self.pre_transformer(
-            #     feat_fuse, batch_data_samples)
-            encoder_inputs_dict, _ = self.pre_transformer(vi_feats, batch_data_samples)
-            encoder_outputs_dict = self.forward_encoder(**encoder_inputs_dict, text_dict=text_dict)
-            
-            text_dict['embedded'] = encoder_outputs_dict['memory_text']
-            
-            encoder_inputs_dict, decoder_inputs_dict = self.pre_transformer(ii_feats, batch_data_samples)
-            ii_encoder_outputs_dict = self.forward_encoder(**encoder_inputs_dict, text_dict=text_dict)
-            
-            encoder_outputs_dict['memory_text'] = ii_encoder_outputs_dict['memory_text']
-            encoder_outputs_dict['memory'] = self.feats_fuse(encoder_outputs_dict['memory'], ii_encoder_outputs_dict['memory'])
-            
-        """
-        feats fusion end
-        """
-
-        # ''' 
-        #     start of the post processing of concatenate visual features
-        # '''
-        # bs = len(batch_data_samples)
-        # encoder_inputs_dict['feat'] = rearrange(encoder_inputs_dict['feat'], '(b two) n c -> b (n two) c', two=2)
-        # encoder_inputs_dict['feat_pos'] = rearrange(encoder_inputs_dict['feat_pos'], '(b two) n c -> b (n two) c', two=2)
-        # encoder_inputs_dict['valid_ratios'] = encoder_inputs_dict['valid_ratios'][:bs]
-        # ''' 
-        #     end of the post processing of concatenate visual features
-        # '''
-        
         tmp_dec_in, head_inputs_dict = self.pre_decoder(
             **encoder_outputs_dict, batch_data_samples=batch_data_samples)
         decoder_inputs_dict.update(tmp_dec_in)
@@ -653,7 +658,8 @@ class GroundingDINO(DINO):
             `hidden_states` of the decoder output and `references` including
             the initial and intermediate reference_points.
         """
-        if self.bbox_head.type == 'GroundingDINOHead':
+        if self.bbox_head.reg_branches[0][-1].out_features == 4:
+            # GroundingDINO Head
             return super().forward_decoder(
                 query=query,
                 memory=memory,
@@ -665,6 +671,7 @@ class GroundingDINO(DINO):
                 dn_mask=dn_mask,
                 **kwargs)
         else:
+            # inter_states, references, pred_corners = self.decoder(
             inter_states, references = self.decoder(
                 query=query,
                 value=memory,
@@ -687,9 +694,10 @@ class GroundingDINO(DINO):
 
             decoder_outputs_dict = dict(
                 hidden_states=inter_states, references=list(references))
+                # hidden_states=inter_states, references=list(references), pred_corners=pred_corners)
             return decoder_outputs_dict
 
-    def loss(self, batch_inputs: Tensor,
+    def loss_head_inputs_dict(self, batch_inputs: Tensor,
              batch_data_samples: SampleList) -> Union[dict, list]:
         text_prompts = [
             data_samples.text for data_samples in batch_data_samples
@@ -769,6 +777,11 @@ class GroundingDINO(DINO):
             visual_features = self.extract_feat(batch_inputs)
         head_inputs_dict = self.forward_transformer(visual_features, text_dict,
                                                     batch_data_samples)
+        return head_inputs_dict
+    
+    def loss(self, batch_inputs: Tensor,
+             batch_data_samples: SampleList) -> Union[dict, list]:
+        head_inputs_dict = self.loss_head_inputs_dict(batch_inputs, batch_data_samples)
 
         losses = self.bbox_head.loss(
             **head_inputs_dict, batch_data_samples=batch_data_samples)
@@ -899,7 +912,7 @@ class GroundingDINO(DINO):
         if self.fusion_module_cfg['use_fusion']:
             #multi-channel image feature extraction pre-processing
             res = []
-            for _batch_input in batch_inputs: # [6, h, w]
+            for _batch_input in batch_inputs: # [bs, 6, h, w]
                 c = _batch_input.shape[0] // 2
                 res.append(_batch_input[:c, ...])
                 res.append(_batch_input[c:, ...])
@@ -908,7 +921,6 @@ class GroundingDINO(DINO):
 
             # image feature extraction
             visual_feats = super().extract_feat(batch_inputs)
-            
 
             _visual_feats = [[], []]
             for i in range(len(visual_feats)):# [2*bs,c0,h0,w0], ... ,[2*bs,c1,h1,w1]
@@ -916,43 +928,7 @@ class GroundingDINO(DINO):
                 _visual_feats[1].append(visual_feats[i][1::2, ...])
             
             return _visual_feats[0], _visual_feats[1]
-            if self.fusion_module_cfg['type']=='moe':
-                pass
-            elif self.fusion_module_cfg['type']=='msd':
-                N = visual_feats[0].shape[0] // 2
-                _visual_feats = [[], []]
-                for i in range(len(visual_feats)):
-                    _visual_feats[0].append(visual_feats[i][:N, ...])
-                    _visual_feats[1].append(visual_feats[i][N:, ...])
-                vif_dict, _ = self.pre_transformer(_visual_feats[0], batch_data_samples=None)
-                iif_dict, _ = self.pre_transformer(_visual_feats[1], batch_data_samples=None)
-                feat_fuse = self.vision_fuser(vif=vif_dict['feat'], vif_pos=vif_dict['feat_pos'],
-                                            iif=iif_dict['feat'], iif_pos=iif_dict['feat_pos'],
-                                            key_padding_mask=vif_dict['feat_mask'],
-                                            spatial_shapes=vif_dict['spatial_shapes'],
-                                            level_start_index=vif_dict['level_start_index'],
-                                            valid_ratios=vif_dict['valid_ratios']
-                                            )
-                return feat_fuse
             
-            elif self.fusion_module_cfg['type']=='add':        
-                N = visual_feats[0].shape[0] // 2
-                _visual_feats = []
-                for i in range(len(visual_feats)):
-                    _visual_feats.append(visual_feats[i].reshape(N, 2, *visual_feats[i].shape[1:]).sum(dim=1, keepdim=False)/2)
-                
-                return tuple(_visual_feats)
-            
-            elif self.fusion_module_cfg['type']=='concat':
-                res_feats = []
-                for vf in visual_feats:
-                    # _vf = rearrange(vf, '(b two) c h w -> b c (h two) w', two=2)
-                    _vf = vf
-                    res_feats.append(_vf)
-                return res_feats
-                return visual_feats
-            
-        
         else:
             # image feature extraction
             visual_feats = super().extract_feat(batch_inputs)
@@ -982,7 +958,146 @@ class GroundingDINO(DINO):
         
         return feat_flatten
     
-    def feats_fuse(self, vi, ii):
-        res = self.vision_fuser(vi, ii)
-        return res
+
+class AttrDict(dict):
+    def __getattr__(self, key):
+        try:
+            return self[key]
+        except KeyError:
+            raise AttributeError(f"No such attribute: {key}")
+
+    def __setattr__(self, key, value):
+        self[key] = value
+
+from typing import Dict, List, Tuple, Union
+import torch
+from mmengine.model import BaseModel
+from torch import Tensor
+
+from mmdet.structures import DetDataSample, OptSampleList, SampleList
+
+ForwardResults = Union[Dict[str, torch.Tensor], List[DetDataSample],
+                       Tuple[torch.Tensor], torch.Tensor]
+from typing import Dict, Optional, Tuple, Union
+
+import torch
+import torch.nn as nn
+
+from mmengine.optim import OptimWrapper
+from mmengine.registry import MODELS
+
+
+
+@MODELS.register_module()
+class DetectorOptimizer(BaseModel):
+    
+    def __init__(self,
+                 *args,
+                 model_cfg,
+                 head_optimizer_cfg = dict(type='HeadOptimizer'),
+                 **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.model = MODELS.build(model_cfg)
+        self.data_preprocessor=self.model.data_preprocessor
+        self.head_optimizer=MODELS.build(head_optimizer_cfg)
+      
+    def load_refmodel(self):
+        self.ref_model = copy.deepcopy(self.model)
+        self.ref_model.eval()
+        self.ref_model.requires_grad_(False)
+        assert self.ref_model.training == False
+    
+    
+    def forward(self,
+                inputs: torch.Tensor,
+                data_samples: OptSampleList = None,
+                mode: str = 'tensor') -> ForwardResults:
+        if mode == 'loss':
+            return self.loss(inputs, data_samples)
+        elif mode == 'predict':
+            return self.predict(inputs, data_samples)
+        elif mode == 'tensor':
+            return self._forward(inputs, data_samples)
+        else:
+            raise RuntimeError(f'Invalid mode "{mode}". '
+                               'Only supports loss, predict and tensor mode')
+    
+    def loss(self, batch_inputs: Tensor,
+             batch_data_samples: SampleList) -> Union[dict, tuple]: 
+        head_inputs_dict = self.model.loss_head_inputs_dict(batch_inputs, batch_data_samples)
+        # ref_head_inputs_dict = self.ref_model.loss_head_inputs_dict(batch_inputs, batch_data_samples)
+        losses = self.head_optimizer(self.model.bbox_head, **head_inputs_dict, batch_data_samples=batch_data_samples)
+        loss_dict = {
+            'reward_loss':losses
+        }
+        return loss_dict
         
+    def predict(self, batch_inputs: Tensor,
+                batch_data_samples: SampleList) -> SampleList:
+        return self.model.predict(batch_inputs, batch_data_samples)
+    
+    def _forward(
+            self,
+            batch_inputs: Tensor,
+            batch_data_samples: OptSampleList = None) -> Tuple[List[Tensor]]:
+        return self.model._forward(batch_inputs, batch_data_samples)
+    
+    
+    
+@MODELS.register_module()
+class DistillOptimizer(BaseModel):
+    
+    def __init__(self,
+                 *args,
+                 model_cfg,
+                #  head_optimizer_cfg = dict(type='HeadOptimizer'),
+                 **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.model = MODELS.build(model_cfg)
+        self.data_preprocessor=self.model.data_preprocessor
+        # self.head_optimizer=MODELS.build(head_optimizer_cfg)
+        
+    def forward(self,
+                inputs: torch.Tensor,
+                data_samples: OptSampleList = None,
+                mode: str = 'tensor') -> ForwardResults:
+        if mode == 'loss':
+            return self.loss(inputs, data_samples)
+        elif mode == 'predict':
+            return self.predict(inputs, data_samples)
+        elif mode == 'tensor':
+            return self._forward(inputs, data_samples)
+        else:
+            raise RuntimeError(f'Invalid mode "{mode}". '
+                               'Only supports loss, predict and tensor mode')
+    
+    def loss(self, batch_inputs: Tensor,
+             batch_data_samples: SampleList) -> Union[dict, tuple]:
+        c = batch_inputs.shape[1]//2
+        degraded_batch_inputs = batch_inputs[:, :c, ...]
+        clean_batch_inputs = batch_inputs[:, c:, ...]
+        
+        degraded_losses = self.model.loss(degraded_batch_inputs, batch_data_samples)
+        clean_losses = self.model.loss(clean_batch_inputs, batch_data_samples)
+        def curate_loss(loss_dict, losses:dict, name):
+            for k, v in losses.items():
+                loss_dict[f'{name}.{k}']=v        
+            return loss_dict
+        
+        loss_dict = dict()
+        loss_dict = curate_loss(loss_dict, degraded_losses, 'degrade')
+        loss_dict = curate_loss(loss_dict, clean_losses, 'clean')
+        return loss_dict
+        
+    def predict(self, batch_inputs: Tensor,
+                batch_data_samples: SampleList) -> SampleList:
+        
+        c = batch_inputs.shape[1]//2
+        degraded_batch_inputs = batch_inputs[:, :c, :, :]
+        return self.model.predict(degraded_batch_inputs, batch_data_samples)
+    
+    def _forward(
+            self,
+            batch_inputs: Tensor,
+            batch_data_samples: OptSampleList = None) -> Tuple[List[Tensor]]:
+        return self.model._forward(batch_inputs, batch_data_samples)

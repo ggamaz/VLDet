@@ -15,7 +15,7 @@ from .deformable_detr_layers import (DeformableDetrTransformerDecoderLayer,
 from .detr_layers import DetrTransformerEncoderLayer
 from .dino_layers import DinoTransformerDecoder
 from .utils import MLP, get_text_sine_pos_embed,coordinate_to_encoding
-from mmdet.structures.bbox import distance2bbox
+from mmdet.structures.bbox import bbox_xyxy_to_cxcywh
 from typing import Tuple
 
 try:
@@ -254,7 +254,30 @@ class GroundingDinoTransformerEncoder(DeformableDetrTransformerEncoder):
                 key_padding_mask=key_padding_mask)
         return output, memory_text
 
+def distance2bbox(points, distance, reg_scale):
+    """
+    Decodes edge-distances into bounding box coordinates.
 
+    Args:
+        points (Tensor): (B, N, 4) or (N, 4) format, representing [x, y, w, h],
+                         where (x, y) is the center and (w, h) are width and height.
+        distance (Tensor): (B, N, 4) or (N, 4), representing distances from the
+                           point to the left, top, right, and bottom boundaries.
+
+        reg_scale (float): Controls the curvature of the Weighting Function.
+
+    Returns:
+        Tensor: Bounding boxes in (N, 4) or (B, N, 4) format [cx, cy, w, h].
+    """
+    reg_scale = abs(reg_scale)
+    x1 = points[..., 0] - (0.5 * reg_scale + distance[..., 0]) * (points[..., 2] / reg_scale)
+    y1 = points[..., 1] - (0.5 * reg_scale + distance[..., 1]) * (points[..., 3] / reg_scale)
+    x2 = points[..., 0] + (0.5 * reg_scale + distance[..., 2]) * (points[..., 2] / reg_scale)
+    y2 = points[..., 1] + (0.5 * reg_scale + distance[..., 3]) * (points[..., 3] / reg_scale)
+
+    bboxes = torch.stack([x1, y1, x2, y2], -1)
+    return bbox_xyxy_to_cxcywh(bboxes)
+from .utils import inverse_sigmoid
 class GroundingDinoTransformerDecoder(DinoTransformerDecoder):
 
     def _init_layers(self) -> None:
@@ -318,8 +341,10 @@ class GroundingDinoTransformerDecoder(DinoTransformerDecoder):
               coordinates are arranged as (cx, cy, w, h)
         """
         intermediate = []
+        intermediate_pred_corners = []
         intermediate_reference_points = [reference_points]
-        pred_corners_undetach = 0
+        IsCornerReg = (integral is not None)
+        
         for lid, layer in enumerate(self.layers):
             if reference_points.shape[-1] == 4:
                 reference_points_input = \
@@ -348,23 +373,32 @@ class GroundingDinoTransformerDecoder(DinoTransformerDecoder):
 
             if reg_branches is not None:
                 pred_corners = reg_branches[lid](query)
-                if integral is not None:
-                    new_reference_points = distance2bbox(reference_points[..., :2], integral(pred_corners))
+                
+                if IsCornerReg:
+                    new_reference_points = distance2bbox(reference_points, integral(pred_corners), integral.reg_scale)
                 else:
                     assert reference_points.shape[-1] == 4
-                    new_reference_points = tmp + inverse_sigmoid(reference_points, eps=1e-3)
+                    new_reference_points = pred_corners + inverse_sigmoid(reference_points, eps=1e-3)
                     new_reference_points = new_reference_points.sigmoid()
 
                 reference_points = new_reference_points.detach()
+
             if self.return_intermediate:
                 intermediate.append(self.norm(query))
                 intermediate_reference_points.append(new_reference_points)
+                if IsCornerReg:
+                    intermediate_pred_corners.append(pred_corners)
                 # NOTE this is for the "Look Forward Twice" module,
                 # in the DeformDETR, reference_points was appended.
-
+        
         if self.return_intermediate:
-            return torch.stack(intermediate), torch.stack(
-                intermediate_reference_points)
+            # if IsCornerReg:
+            #     return torch.stack(intermediate),\
+            #         torch.stack(intermediate_reference_points),\
+            #             torch.stack(intermediate_pred_corners)
+            # else:
+                return torch.stack(intermediate),\
+                    torch.stack(intermediate_reference_points)
 
         return query, reference_points
 
@@ -449,15 +483,18 @@ class FeedForwardFusion(nn.Module):
     def __init__(self, in_channels,hidden_channels):
         super().__init__()
         self.gate = nn.SELU()
-        self.w1 = nn.Linear(in_channels, hidden_channels)
+        self.hid = hidden_channels
+        self.w1 = nn.Sequential(
+                nn.Linear(2*in_channels, hidden_channels//4),
+                nn.Linear(hidden_channels//4, 2*hidden_channels))
         self.w2 = nn.Linear(in_channels, hidden_channels)
         self.w3 = nn.Linear(hidden_channels, in_channels)
-        self._init_layers()
     
-    def _init_layers(self) -> None:
+    def init_weights(self) -> None:
         import torch.nn.init as init
         # init.constant_(self.w1.weight, 0.0)
-        init.eye_(self.w1.weight)
+        init.eye_(self.w1[0].weight)
+        init.eye_(self.w1[1].weight)
         init.eye_(self.w2.weight)
         init.eye_(self.w3.weight)
         
@@ -465,10 +502,15 @@ class FeedForwardFusion(nn.Module):
         dim = x.shape[-1]
         a = x[..., :dim//2] #vx
         b = x[..., dim//2:] #ix
-        gate_b = self.gate(self.w1(b))
-        gate_a = self.gate(self.w1(a))
-
-        return self.w3(gate_a*self.w2(a) + self.w2(b) * gate_b)
+        gate = self.gate(self.w1(x))
+        
+        gate_a, gate_b=gate[..., :self.hid], gate[..., self.hid:] #(..., dim)
+        softmax_gate = F.softmax(torch.stack([gate_a, gate_b], dim=-1), dim=-1) #(..., dim, 2)
+        
+        sf_ga, sf_gb=softmax_gate[..., 0], softmax_gate[..., 1]
+        
+        return self.w3(sf_ga*self.w2(a) + self.w2(b) * sf_gb)
+        # return self.w3(self.w2(a) + self.w2(b) * gate_b)
     
 import math
 import torch.nn.functional as F
@@ -588,3 +630,7 @@ class MoEFuser(nn.Module):
             expert_cache.scatter_add_(0, exp_token_idx.view(-1, 1).repeat(1, dim), expert_out)
 
         return expert_cache
+    
+    def init_weights(self):
+        for m in self.experts:
+            m.init_weights()

@@ -26,7 +26,7 @@ from .fsaf_head import FSAFHead
 from .ga_retina_head import GARetinaHead
 from .ga_rpn_head import GARPNHead
 from .gfl_head import GFLHead
-from .grounding_dino_head import GroundingDINOHead, GroundingDFINEHead
+from .grounding_dino_head import GroundingDINOHead, GroundingDFINEHead, HeadOptimizer
 from .guided_anchor_head import FeatureAdaption, GuidedAnchorHead
 from .lad_head import LADHead
 from .ld_head import LDHead
@@ -69,5 +69,5 @@ __all__ = [
     'CondInstMaskHead', 'RTMDetInsHead', 'RTMDetInsSepBNHead',
     'BoxInstBboxHead', 'BoxInstMaskHead', 'ConditionalDETRHead', 'DINOHead',
     'ATSSVLFusionHead', 'DABDETRHead', 'DDQDETRHead', 'GroundingDINOHead',
-    'GroundingDFINEHead'
+    'GroundingDFINEHead','HeadOptimizer'
 ]
