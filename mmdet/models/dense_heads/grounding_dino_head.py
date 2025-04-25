@@ -492,7 +492,7 @@ class GroundingDINOHead(DINOHead):
             batch_img_metas.append(data_sample.metainfo)
             batch_gt_instances.append(data_sample.gt_instances)
 
-        outs = self(hidden_states, references, memory_text, text_token_mask)
+        outs = self(hidden_states, references, memory_text, text_token_mask)#all_layers_outputs_classes, all_layers_outputs_coords
         self.text_masks = text_token_mask
         loss_inputs = outs + (enc_outputs_class, enc_outputs_coord,
                               batch_gt_instances, batch_img_metas, dn_meta)

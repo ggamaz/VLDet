@@ -7,7 +7,7 @@ dataset_type = 'PairedCocoDataset'
 
 model = dict(
     bbox_head=dict(
-        num_classes=11,),
+        num_classes=5,),
     # bbox_head=dict(
     #     type='GroundingDFINEHead',
     #     num_classes=11,
@@ -103,8 +103,10 @@ DV_Dataset = dict(
     filter_cfg=dict(filter_empty_gt=False, min_size=32),
     ann_file='coco_annotations/DV_train_ir.json',
     data_prefix=dict(
-        imga='degraded_train/rgb/images/',
-        imgb='degraded_train/ir/images/'))
+            imgc='train/rgb/images/',
+            imgd='train/ir/images/'))
+        # imga='degraded_train/rgb/images/',
+        # imgb='degraded_train/ir/images/'))
 
 M3FD_Dataset = dict(
         _delete_=True,
@@ -171,8 +173,10 @@ val_dataloader = dict(
         ann_file='coco_annotations/DV_test_ir.json',
         data_prefix=dict(
             _delete_=True,
-            imga='degraded_test/rgb/images/',
-            imgb='degraded_test/ir/images/')))
+            # imga='degraded_test/rgb/images/',
+            # imgb='degraded_test/ir/images/')))
+            imgc='train/rgb/images/',
+            imgd='train/ir/images/')))
 
 test_dataloader = val_dataloader
 
@@ -183,7 +187,7 @@ test_evaluator = val_evaluator
 max_epoch = 20
 
 default_hooks = dict(
-    checkpoint=dict(interval=1, max_keep_ckpts=1, save_best='auto'),
+    checkpoint=dict(interval=1, max_keep_ckpts=1, save_best=['coco/bbox_mAP_50']),
     logger=dict(type='LoggerHook', interval=10))
 train_cfg = dict(max_epochs=max_epoch, val_interval=1)
 
@@ -208,6 +212,8 @@ optim_wrapper = dict(
             # 'decoder': dict(lr_mult=0.0),
             # 'bbox_head': dict(lr_mult=0.0),
         }))
-
+# find_unused_parameters = True
+# detect_anomalous_params = True
+# find_unused_parameters=False
 load_from = 'https://download.openmmlab.com/mmdetection/v3.0/mm_grounding_dino/grounding_dino_swin-t_pretrain_obj365_goldg_grit9m_v3det/grounding_dino_swin-t_pretrain_obj365_goldg_grit9m_v3det_20231204_095047-b448804b.pth'  # noqa
 # load_from = "/root/VLDet/work_dirs/afterbackbone_a+b_grounding_dino_swin-t_finetune_8xb4_20e_cat/best_coco_car_precision_epoch_11.pth"

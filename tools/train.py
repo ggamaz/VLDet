@@ -8,11 +8,11 @@ from mmengine.registry import RUNNERS
 from mmengine.runner import Runner
 
 from mmdet.utils import setup_cache_size_limit_of_dynamo
-
+import torch
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Train a detector')
-    parser.add_argument('--config', default='local_configs/grounding_dino_swin-t_finetune_8xb4_20e_quadruple.py', help='train config file path')
+    parser.add_argument('--config', default='local_configs/grounding_dino_swin-t_finetune_8xb4_20e_cat.py', help='train config file path')
     parser.add_argument('--work-dir', help='the dir to save logs and models')
     parser.add_argument(
         '--amp',
@@ -59,7 +59,7 @@ def parse_args():
 
 def main():
     args = parse_args()
-
+    
     # Reduce the number of repeated compilations and improve
     # training speed.
     setup_cache_size_limit_of_dynamo()
@@ -112,7 +112,7 @@ def main():
         # build customized runner from the registry
         # if 'runner_type' is set in the cfg
         runner = RUNNERS.build(cfg)
-
+    
     # start training
     runner.train()
 

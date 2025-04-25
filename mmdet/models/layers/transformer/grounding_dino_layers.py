@@ -179,7 +179,9 @@ class GroundingDinoTransformerEncoder(DeformableDetrTransformerEncoder):
                 text_attention_mask: Tensor = None,
                 pos_text: Tensor = None,
                 text_self_attention_masks: Tensor = None,
-                position_ids: Tensor = None):
+                position_ids: Tensor = None,
+                concated_feats:bool=False
+                ):
         """Forward function of Transformer encoder.
 
         Args:
@@ -245,13 +247,32 @@ class GroundingDinoTransformerEncoder(DeformableDetrTransformerEncoder):
                         text_num_heads, 1, 1),  # note we use ~ for mask here
                     key_padding_mask=None,
                 )
-            output = layer(
-                query=output,
-                query_pos=query_pos,
-                reference_points=reference_points,
-                spatial_shapes=spatial_shapes,
-                level_start_index=level_start_index,
-                key_padding_mask=key_padding_mask)
+            if not concated_feats:
+                output = layer(
+                    query=output,
+                    query_pos=query_pos,
+                    reference_points=reference_points,
+                    spatial_shapes=spatial_shapes,
+                    level_start_index=level_start_index,
+                    key_padding_mask=key_padding_mask)
+            else:
+                vi_out, ii_out = output.chunk(chunks=2, dim=1)
+                vi_out = layer(
+                    query=vi_out,
+                    query_pos=query_pos,
+                    reference_points=reference_points,
+                    spatial_shapes=spatial_shapes,
+                    level_start_index=level_start_index,
+                    key_padding_mask=key_padding_mask)
+                ii_out = layer(
+                    query=ii_out,
+                    query_pos=query_pos,
+                    reference_points=reference_points,
+                    spatial_shapes=spatial_shapes,
+                    level_start_index=level_start_index,
+                    key_padding_mask=key_padding_mask)
+                output = torch.concat([vi_out, ii_out], dim=1)            
+                
         return output, memory_text
 
 def distance2bbox(points, distance, reg_scale):
@@ -459,7 +480,15 @@ class MSDeformableVisionFuser(DeformableDetrTransformerEncoder):
                 spatial_shapes=spatial_shapes,
                 level_start_index=level_start_index,
                 key_padding_mask=key_padding_mask)
-            vif = out_vif 
+            vif = out_vif
+            # vif, iif = layer.cross_forward(vi_query=vif,
+            #         vi_query_pos=vif_pos,
+            #         ii_query=iif,
+            #         ii_query_pos=iif_pos,
+            #         reference_points=reference_points,
+            #         spatial_shapes = spatial_shapes,
+            #         level_start_index= level_start_index,
+            #         key_padding_mask=key_padding_mask)
         feats_fuse = (vif + iif)/2        
         return feats_fuse
 

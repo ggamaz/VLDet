@@ -42,6 +42,21 @@ def chunks(lst: list, n: int) -> list:
     return all_
 
 
+import traceback
+from collections import defaultdict
+
+hook_counts = defaultdict(int)
+
+def make_hook(name):
+    def hook(grad):
+        hook_counts[name] += 1
+        if hook_counts[name] > 1:
+            print(f"[DEBUG] `{name}` hook called {hook_counts[name]} times. Stack:")
+            traceback.print_stack()
+        return grad
+    return hook
+
+
 from ..layers.transformer.grounding_dino_layers import MSDeformableVisionFuser, MoEFuser
 @MODELS.register_module()
 class GroundingDINO(DINO):
@@ -100,6 +115,7 @@ class GroundingDINO(DINO):
             elif self.fusion_module_cfg['type'] == 'msd':
                 msd_cfg = self.fusion_module_cfg['msd_cfg']
                 self.vision_fuser = MSDeformableVisionFuser(**msd_cfg)
+
             
     def init_weights(self) -> None:
         """Initialize weights for Transformer and other components."""
@@ -321,45 +337,73 @@ class GroundingDINO(DINO):
         text_dict: Dict,
         batch_data_samples: OptSampleList = None,
     ) -> Dict:
+        # 在 DDP 包装前，或包装后都可以，只要在 .forward() 调用前：
+        # for name, param in  self.vision_fuser.named_parameters():
+        #     param.register_hook(make_hook(name))
         if self.fusion_module_cfg['use_fusion']:
             vi_feats, ii_feats = img_feats
             """
             feats fusion begin
             """
             if self.fusion_module_cfg['type']=='msd':
+                # #before encoder
+                # vif_dict, decoder_inputs_dict = self.pre_transformer(vi_feats, batch_data_samples=None)
+                # iif_dict, _ = self.pre_transformer(ii_feats, batch_data_samples=None)
+                # feat_fuse = self.vision_fuser(vif=vif_dict['feat'], vif_pos=vif_dict['feat_pos'],
+                #                             iif=iif_dict['feat'], iif_pos=iif_dict['feat_pos'],
+                #                             key_padding_mask=vif_dict['feat_mask'],
+                #                             spatial_shapes=vif_dict['spatial_shapes'],
+                #                             level_start_index=vif_dict['level_start_index'],
+                #                             valid_ratios=vif_dict['valid_ratios']
+                #                         )
+                # vif_dict['feat'] = feat_fuse
+                # encoder_inputs_dict = vif_dict
+                # encoder_outputs_dict = self.forward_encoder(**encoder_inputs_dict, text_dict=text_dict)
+                
+                #after encoder
                 vif_dict, decoder_inputs_dict = self.pre_transformer(vi_feats, batch_data_samples=None)
                 iif_dict, _ = self.pre_transformer(ii_feats, batch_data_samples=None)
-                feat_fuse = self.vision_fuser(vif=vif_dict['feat'], vif_pos=vif_dict['feat_pos'],
-                                            iif=iif_dict['feat'], iif_pos=iif_dict['feat_pos'],
-                                            key_padding_mask=vif_dict['feat_mask'],
-                                            spatial_shapes=vif_dict['spatial_shapes'],
-                                            level_start_index=vif_dict['level_start_index'],
-                                            valid_ratios=vif_dict['valid_ratios']
-                                        )
-                vif_dict['feat'] = feat_fuse
+                vif_dict['feat']=torch.concat([vif_dict['feat'], iif_dict['feat']], dim=1)
                 encoder_inputs_dict = vif_dict
-                encoder_outputs_dict = self.forward_encoder(**encoder_inputs_dict, text_dict=text_dict)
+                encoder_outputs_dict = self.forward_encoder(**encoder_inputs_dict, text_dict=text_dict,concated_feats=True)                
+                vi_feats, ii_feats = encoder_outputs_dict['memory'].chunk(chunks=2, dim=1)
+                encoder_outputs_dict['memory'] = self.vision_fuser(
+                                                    vif=vi_feats, vif_pos=vif_dict['feat_pos'],
+                                                    iif=ii_feats, iif_pos=iif_dict['feat_pos'],
+                                                    key_padding_mask=vif_dict['feat_mask'],
+                                                    spatial_shapes=vif_dict['spatial_shapes'],
+                                                    level_start_index=vif_dict['level_start_index'],
+                                                    valid_ratios=vif_dict['valid_ratios'])
                 
+                            
+            elif self.fusion_module_cfg['type']=='moe':
+                # # feat_fuse = self.vision_fuser(vi_feats, ii_feats)
+                # # encoder_inputs_dict, decoder_inputs_dict = self.pre_transformer(
+                # #     feat_fuse, batch_data_samples)
+                # #串接
+                # encoder_inputs_dict, _ = self.pre_transformer(vi_feats, batch_data_samples)
+                # encoder_outputs_dict = self.forward_encoder(**encoder_inputs_dict, text_dict=text_dict)
+                
+                # text_dict['embedded'] = encoder_outputs_dict['memory_text']
+                
+                # encoder_inputs_dict, decoder_inputs_dict = self.pre_transformer(ii_feats, batch_data_samples)
+                # ii_encoder_outputs_dict = self.forward_encoder(**encoder_inputs_dict, text_dict=text_dict)
+                
+                # encoder_outputs_dict['memory_text'] = ii_encoder_outputs_dict['memory_text']
+                # encoder_outputs_dict['memory'] = self.vision_fuser(encoder_outputs_dict['memory'], ii_encoder_outputs_dict['memory'])
+                #并联
+                vif_dict, decoder_inputs_dict = self.pre_transformer(vi_feats, batch_data_samples=None)
+                iif_dict, _ = self.pre_transformer(ii_feats, batch_data_samples=None)
+                vif_dict['feat']=torch.concat([vif_dict['feat'], iif_dict['feat']], dim=1)
+                encoder_inputs_dict = vif_dict
+                encoder_outputs_dict = self.forward_encoder(**encoder_inputs_dict, text_dict=text_dict,concated_feats=True)                
+                vi_feats, ii_feats = encoder_outputs_dict['memory'].chunk(chunks=2, dim=1)
+                encoder_outputs_dict['memory'] = self.vision_fuser(vi_feats, ii_feats)
+
             elif self.fusion_module_cfg['type']=='add':
                 feat_fuse = [(v+i)/2 for v, i in zip(vi_feats, ii_feats)]
                 encoder_inputs_dict, decoder_inputs_dict = self.pre_transformer(feat_fuse, batch_data_samples)
                 encoder_outputs_dict = self.forward_encoder(**encoder_inputs_dict, text_dict=text_dict)
-                            
-            elif self.fusion_module_cfg['type']=='moe':
-                # feat_fuse = self.vision_fuser(vi_feats, ii_feats)
-                # encoder_inputs_dict, decoder_inputs_dict = self.pre_transformer(
-                #     feat_fuse, batch_data_samples)
-                encoder_inputs_dict, _ = self.pre_transformer(vi_feats, batch_data_samples)
-                encoder_outputs_dict = self.forward_encoder(**encoder_inputs_dict, text_dict=text_dict)
-                
-                text_dict['embedded'] = encoder_outputs_dict['memory_text']
-                
-                encoder_inputs_dict, decoder_inputs_dict = self.pre_transformer(ii_feats, batch_data_samples)
-                ii_encoder_outputs_dict = self.forward_encoder(**encoder_inputs_dict, text_dict=text_dict)
-                
-                encoder_outputs_dict['memory_text'] = ii_encoder_outputs_dict['memory_text']
-                encoder_outputs_dict['memory'] = self.vision_fuser(encoder_outputs_dict['memory'], ii_encoder_outputs_dict['memory'])
-                
                    
             # elif self.fusion_module_cfg['type']=='concat':
                 
@@ -516,7 +560,7 @@ class GroundingDINO(DINO):
     def forward_encoder(self, feat: Tensor, feat_mask: Tensor,
                         feat_pos: Tensor, spatial_shapes: Tensor,
                         level_start_index: Tensor, valid_ratios: Tensor,
-                        text_dict: Dict) -> Dict:
+                        text_dict: Dict,concated_feats:bool=False) -> Dict:
         text_token_mask = text_dict['text_token_mask']
         memory, memory_text = self.encoder(
             query=feat,
@@ -529,7 +573,9 @@ class GroundingDINO(DINO):
             memory_text=text_dict['embedded'],
             text_attention_mask=~text_token_mask,
             position_ids=text_dict['position_ids'],
-            text_self_attention_masks=text_dict['masks'])
+            text_self_attention_masks=text_dict['masks'],
+            #concated feats
+            concated_feats=concated_feats)
         encoder_outputs_dict = dict(
             memory=memory,
             memory_mask=feat_mask,
@@ -787,7 +833,7 @@ class GroundingDINO(DINO):
             **head_inputs_dict, batch_data_samples=batch_data_samples)
         
         if self.fusion_module_cfg['use_fusion'] and self.fusion_module_cfg['type'] == 'moe':
-            losses['moe_loss'] = self.vision_fuser.aux_loss
+            losses['loss_moe'] = self.vision_fuser.aux_loss
         return losses
 
     def predict(self, batch_inputs, batch_data_samples, rescale: bool = True):
@@ -983,7 +1029,6 @@ from typing import Dict, Optional, Tuple, Union
 import torch
 import torch.nn as nn
 
-from mmengine.optim import OptimWrapper
 from mmengine.registry import MODELS
 
 
@@ -1051,10 +1096,12 @@ class DistillOptimizer(BaseModel):
                  *args,
                  model_cfg,
                 #  head_optimizer_cfg = dict(type='HeadOptimizer'),
-                 **kwargs) -> None:
+                sft_type='mimicking',
+                **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self.model = MODELS.build(model_cfg)
         self.data_preprocessor=self.model.data_preprocessor
+        self.sft = sft_type
         # self.head_optimizer=MODELS.build(head_optimizer_cfg)
         
     def forward(self,
@@ -1073,20 +1120,44 @@ class DistillOptimizer(BaseModel):
     
     def loss(self, batch_inputs: Tensor,
              batch_data_samples: SampleList) -> Union[dict, tuple]:
-        c = batch_inputs.shape[1]//2
-        degraded_batch_inputs = batch_inputs[:, :c, ...]
-        clean_batch_inputs = batch_inputs[:, c:, ...]
+        # c = batch_inputs.shape[1]//2
+        # degraded_batch_inputs = batch_inputs[:, :c, ...]
+        # clean_batch_inputs = batch_inputs[:, c:, ...]
+        degraded_batch_inputs, clean_batch_inputs = batch_inputs.chunk(chunks=2, dim=1)
+        if self.sft=='same':
+            """同时学习"""
+            degraded_losses = self.model.loss(degraded_batch_inputs, batch_data_samples)
+            clean_losses = self.model.loss(clean_batch_inputs, batch_data_samples)
+            def curate_loss(loss_dict, losses:dict, name):
+                for k, v in losses.items():
+                    loss_dict[f'{name}.{k}']=v        
+                return loss_dict
+            
+            loss_dict = dict()
+            loss_dict = curate_loss(loss_dict, degraded_losses, 'degrade')
+            loss_dict = curate_loss(loss_dict, clean_losses, 'clean')
         
-        degraded_losses = self.model.loss(degraded_batch_inputs, batch_data_samples)
-        clean_losses = self.model.loss(clean_batch_inputs, batch_data_samples)
-        def curate_loss(loss_dict, losses:dict, name):
-            for k, v in losses.items():
-                loss_dict[f'{name}.{k}']=v        
-            return loss_dict
-        
-        loss_dict = dict()
-        loss_dict = curate_loss(loss_dict, degraded_losses, 'degrade')
-        loss_dict = curate_loss(loss_dict, clean_losses, 'clean')
+        elif self.sft=='mimicking':
+            """feature mimicking"""
+            degraded_head_inputs_dict = self.model.loss_head_inputs_dict(degraded_batch_inputs, batch_data_samples)
+            clean_head_inputs_dict = self.model.loss_head_inputs_dict(clean_batch_inputs, batch_data_samples)
+            
+            loss_dict = self.model.bbox_head.loss(**degraded_head_inputs_dict, batch_data_samples=batch_data_samples)
+            if self.model.fusion_module_cfg['use_fusion'] and self.model.fusion_module_cfg['type'] == 'moe':
+                loss_dict['loss_moe'] = self.model.vision_fuser.aux_loss
+            clean_feats, degraded_feats = clean_head_inputs_dict['hidden_states'], degraded_head_inputs_dict['hidden_states']
+            def feats_mimicking(ft, fs):
+                #ft,fs: num_layers, bs, num_queries, dim
+                losses = []
+                for layer_ft, layer_fs in zip(ft, fs):
+                    loss = F.mse_loss(layer_ft, layer_fs)
+                    losses.append(loss)
+                return torch.mean(torch.stack(losses, 0))
+            
+            loss_fm = feats_mimicking(clean_feats, degraded_feats)
+            loss_dict['loss_fm']=loss_fm
+        else:
+            raise ValueError('no specific sft type')
         return loss_dict
         
     def predict(self, batch_inputs: Tensor,

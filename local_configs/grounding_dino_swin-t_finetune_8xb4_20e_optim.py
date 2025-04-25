@@ -314,7 +314,7 @@ test_evaluator = val_evaluator
 max_epoch = 20
 
 default_hooks = dict(
-    checkpoint=dict(interval=1, max_keep_ckpts=1, save_best='auto'),
+    checkpoint=dict(interval=1, max_keep_ckpts=1, save_best=['coco/bbox_mAP_50']),
     logger=dict(type='LoggerHook', interval=10))
 train_cfg = dict(max_epochs=max_epoch, val_interval=1)
 
